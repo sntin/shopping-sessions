@@ -324,6 +324,36 @@ fn parse_datetime(s: &[u8]) -> Option<i64> {
     Some(((days * 24 + h as i64) * 60 + mi as i64) * 60_000 + se as i64 * 1000)
 }
 
+/// ingest_ts is always a valid F1 timestamp: parse it without validation (falls back to
+/// the full parser if the shape is unexpected). Returns epoch seconds.
+#[inline(always)]
+fn parse_ingest_secs(s: &[u8]) -> Option<i64> {
+    if s.len() != 20 {
+        return parse_ts(s).map(|t| t.div_euclid(1000));
+    }
+    let a = ld8(s, 0) ^ 0x3030_3030_3030_3030; // YYYY-MM-
+    let b = ld8(s, 8) ^ 0x3030_3030_3030_3030; // DDTHH:MM
+    let c = ld8(s, 11) ^ 0x3030_3030_3030_3030; // HH:MM:SS
+    let by = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as u32;
+    let y = by(a, 0) * 1000 + by(a, 1) * 100 + by(a, 2) * 10 + by(a, 3);
+    let mo = by(a, 5) * 10 + by(a, 6);
+    let d = by(b, 0) * 10 + by(b, 1);
+    let h = by(c, 0) * 10 + by(c, 1);
+    let mi = by(c, 3) * 10 + by(c, 4);
+    let se = by(c, 6) * 10 + by(c, 7);
+    if !(1900..2200).contains(&y) || mo < 1 || mo > 12 {
+        return parse_ts(s).map(|t| t.div_euclid(1000));
+    }
+    const CUM: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let days = YEAR_START.get_or_init(|| (1900..2200).map(|yy| days_from_civil(yy, 1, 1) as i32).collect::<Vec<i32>>())
+        [(y - 1900) as usize] as i64
+        + CUM[mo as usize] as i64
+        + (mo > 2 && is_leap(y)) as i64
+        + d as i64
+        - 1;
+    Some(((days * 24 + h as i64) * 60 + mi as i64) * 60 + se as i64)
+}
+
 /// Parse an event/click ts to epoch ms. None = bad timestamp.
 #[inline(always)]
 fn parse_ts(s: &[u8]) -> Option<i64> {
@@ -883,8 +913,9 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
                 if eid.is_empty() {
                     return;
                 }
-                let ingest = match parse_ts(f[3]) {
-                    Some(t) => t,
+                let ingest_s = parse_ingest_secs(f[3]);
+                let ingest = match ingest_s {
+                    Some(t) => t * 1000,
                     None => i64::MAX,
                 };
                 let mut valid = true;
@@ -923,7 +954,7 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
                 }
                 let eh = h2(eid);
                 let (uh, uptr, rel) = if valid { (h1(user), pack(user), (ts - ctx.base) as u32) } else { (0, 0, INVALID) };
-                let ingest = if ingest == i64::MAX { u32::MAX } else { (ingest / 1000).clamp(0, u32::MAX as i64 - 1) as u32 };
+                let ingest = match ingest_s { Some(t) => t.clamp(0, u32::MAX as i64 - 1) as u32, None => u32::MAX };
                 if nopush { acc_np = acc_np.wrapping_add(eh.lo ^ uh ^ uptr ^ rel as u64); return; }
                 parts[part2(eh)].push(EvRec {
                     eid_lo: eh.lo,

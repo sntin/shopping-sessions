@@ -699,20 +699,12 @@ fn main() {
     // ---- stage 1 (concurrently): links -> name map, clicks parse; events parse + dedup
     // links run on a dedicated thread (small input, sequential union-find) while all
     // pool threads parse events.
-    let ln_files2 = ln_files.clone();
-    let build = move || {
-        let lm = if std::env::var_os("SS_OLDLINKS").is_some() { build_links(&ln_files2) } else { build_links_par(&ln_files2) };
+    {
+        let lm = if std::env::var_os("SS_OLDLINKS").is_some() { build_links(&ln_files) } else { build_links_par(&ln_files) };
         eprintln!("[{:?}] links done ({} remapped ids)", t0.elapsed(), lm.len);
         let _ = LINKS.set(lm);
-    };
-    // Links build on their own small pool while all main pool threads parse events;
-    // chunks parsed before the link map is ready wait in a side buffer.
-    let nl = (std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) / 2).max(1);
-    let lt = std::thread::spawn(move || {
-        rayon::ThreadPoolBuilder::new().num_threads(nl).build().unwrap().install(build);
-    });
+    }
     let ev_chunks = parse_events(&ev_files, &ctx);
-    lt.join().unwrap();
     eprintln!("[{:?}] events parsed", t0.elapsed());
     let linkmap = LINKS.get().unwrap();
     let click_parts = parse_clicks(&cl_files, &ctx, &linkmap);

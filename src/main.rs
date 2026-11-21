@@ -51,7 +51,7 @@ fn hash_bytes(b: &[u8]) -> u64 {
 
 #[inline(always)]
 fn part_of(h: u64) -> usize {
-    (h >> 56) as usize & (P - 1)
+    (h >> 40) as usize & (P - 1)
 }
 
 // ---------------------------------------------------------------- CSV dialect
@@ -318,12 +318,43 @@ fn json_str(s: &str, key: &str) -> String {
 
 // ---------------------------------------------------------------- records
 
+/// 128-bit identity of a string (xxh3-128). Collisions among a few million IDs are ~1e-25.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct H2 {
+    lo: u64,
+    hi: u64,
+}
+
+#[inline(always)]
+fn h2(b: &[u8]) -> H2 {
+    let v = xxhash_rust::xxh3::xxh3_128(b);
+    H2 { lo: v as u64, hi: (v >> 64) as u64 }
+}
+
+#[inline(always)]
+fn part2(h: H2) -> usize {
+    (h.hi >> 40) as usize & (P - 1)
+}
+
+/// Pack a &'static [u8] into a u64 (48-bit pointer, 16-bit length).
+#[inline(always)]
+fn pack(b: Bytes) -> u64 {
+    debug_assert!(b.len() < 65536);
+    (b.as_ptr() as u64) | ((b.len() as u64) << 48)
+}
+
+#[inline(always)]
+fn unpack(x: u64) -> Bytes {
+    unsafe { std::slice::from_raw_parts((x & 0xFFFF_FFFF_FFFF) as *const u8, (x >> 48) as usize) }
+}
+
 #[derive(Clone, Copy)]
 struct EvRec {
-    eid: Bytes,
-    user: Bytes,
+    eid: H2,
+    user: H2,
+    uptr: u64,
     ingest: i64,
-    ts: i64,
+    rel: u32,
     price: u32, // 0 = not a purchase
     cat: u16,
     valid: bool,
@@ -331,8 +362,8 @@ struct EvRec {
 
 #[derive(Clone, Copy)]
 struct PEv {
-    name: Bytes,
-    hash: u64,
+    ph: H2,
+    pptr: u64,
     rel: u32, // ts - (ws - 7d)
     price: u32,
     cat: u16,
@@ -340,11 +371,10 @@ struct PEv {
 
 #[derive(Clone, Copy)]
 struct PCl {
-    name: Bytes,
-    hash: u64,
+    ph: H2,
+    cid: u64,
     rel: u32,
     camp: u16,
-    cid: Bytes,
 }
 
 struct Ctx {
@@ -416,7 +446,7 @@ fn main() {
     let (link_and_clicks, ev_kept) = rayon::join(
         || {
             let linkmap = build_links(&ln_files);
-            eprintln!("[{:?}] links done ({} remapped ids)", t0.elapsed(), linkmap.len());
+            eprintln!("[{:?}] links done ({} ids)", t0.elapsed(), linkmap.id_h.len());
             let clicks = parse_clicks(&cl_files, &ctx, &linkmap);
             eprintln!("[{:?}] clicks parsed", t0.elapsed());
             (linkmap, clicks)
@@ -434,7 +464,7 @@ fn main() {
         .into_par_iter()
         .map(|p| {
             let mut out: Vec<Vec<PEv>> = (0..P).map(|_| Vec::new()).collect();
-            dedup_partition(&ev_kept, p, &ctx, &linkmap, &mut out);
+            dedup_partition(&ev_kept, p, &linkmap, &mut out);
             out
         })
         .collect();
@@ -497,25 +527,47 @@ fn main() {
 
 // ---------------------------------------------------------------- links
 
-fn build_links(files: &[PathBuf]) -> HashMap<Bytes, Bytes> {
-    let chunks = chunks_of(files, 8 << 20);
-    let pairs: Vec<Vec<(Bytes, Bytes)>> = chunks
+struct LinkMap {
+    table: HashTable<u32>,
+    id_h: Vec<H2>,
+    id_ptr: Vec<u64>,
+    root: Vec<u32>,
+}
+
+impl LinkMap {
+    /// Resolve an ID to its person (hash, name pointer).
+    #[inline(always)]
+    fn resolve(&self, h: H2, ptr: u64) -> (H2, u64) {
+        match self.table.find(h.lo, |&j| self.id_h[j as usize] == h) {
+            Some(&j) => {
+                let r = self.root[j as usize] as usize;
+                (self.id_h[r], self.id_ptr[r])
+            }
+            None => (h, ptr),
+        }
+    }
+}
+
+fn build_links(files: &[PathBuf]) -> LinkMap {
+    let chunks = chunks_of(files, 4 << 20);
+    let pairs: Vec<Vec<(H2, u64, H2, u64)>> = chunks
         .par_iter()
         .map(|c| {
             let mut v = Vec::new();
             for_each_line(c, |line| {
                 let mut f: [Bytes; 2] = [&[]; 2];
                 if split_line::<2>(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((f[0], f[1]));
+                    v.push((h2(f[0]), pack(f[0]), h2(f[1]), pack(f[1])));
                 }
             });
             v
         })
         .collect();
     let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let mut ids: HashMap<Bytes, u32> = HashMap::with_capacity(total * 2);
-    let mut names: Vec<Bytes> = Vec::with_capacity(total * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(total * 2);
+    let mut table: HashTable<u32> = HashTable::with_capacity(total + 16);
+    let mut id_h: Vec<H2> = Vec::with_capacity(total + 16);
+    let mut id_ptr: Vec<u64> = Vec::with_capacity(total + 16);
+    let mut parent: Vec<u32> = Vec::with_capacity(total + 16);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let gp = parent[parent[x as usize] as usize];
@@ -524,22 +576,28 @@ fn build_links(files: &[PathBuf]) -> HashMap<Bytes, Bytes> {
         }
         x
     }
-    let mut intern = |s: Bytes, names: &mut Vec<Bytes>, parent: &mut Vec<u32>| -> u32 {
-        *ids.entry(s).or_insert_with(|| {
-            names.push(s);
-            parent.push(parent.len() as u32);
-            (names.len() - 1) as u32
-        })
+    let mut intern = |h: H2, ptr: u64, id_h: &mut Vec<H2>, id_ptr: &mut Vec<u64>, parent: &mut Vec<u32>| -> u32 {
+        match table.entry(h.lo, |&j| id_h[j as usize] == h, |&j| id_h[j as usize].lo) {
+            hashbrown::hash_table::Entry::Occupied(o) => *o.get(),
+            hashbrown::hash_table::Entry::Vacant(v) => {
+                let id = id_h.len() as u32;
+                id_h.push(h);
+                id_ptr.push(ptr);
+                parent.push(id);
+                v.insert(id);
+                id
+            }
+        }
     };
     for v in &pairs {
-        for &(a, b) in v {
-            let ia = intern(a, &mut names, &mut parent);
-            let ib = intern(b, &mut names, &mut parent);
+        for &(ha, pa, hb, pb) in v {
+            let ia = intern(ha, pa, &mut id_h, &mut id_ptr, &mut parent);
+            let ib = intern(hb, pb, &mut id_h, &mut id_ptr, &mut parent);
             let ra = find(&mut parent, ia);
             let rb = find(&mut parent, ib);
             if ra != rb {
-                // union by keeping the root whose name is smaller as root
-                if names[ra as usize] <= names[rb as usize] {
+                // the root always holds the byte-wise smallest name of its set
+                if unpack(id_ptr[ra as usize]) <= unpack(id_ptr[rb as usize]) {
                     parent[rb as usize] = ra;
                 } else {
                     parent[ra as usize] = rb;
@@ -547,15 +605,12 @@ fn build_links(files: &[PathBuf]) -> HashMap<Bytes, Bytes> {
             }
         }
     }
-    // root always holds the smallest name (we union smaller-name root on top)
-    let mut map: HashMap<Bytes, Bytes> = HashMap::new();
-    for i in 0..names.len() as u32 {
-        let r = find(&mut parent, i);
-        if r != i {
-            map.insert(names[i as usize], names[r as usize]);
-        }
+    let n = id_h.len();
+    let mut root = vec![0u32; n];
+    for i in 0..n as u32 {
+        root[i as usize] = find(&mut parent, i);
     }
-    map
+    LinkMap { table, id_h, id_ptr, root }
 }
 
 // ---------------------------------------------------------------- events
@@ -607,21 +662,16 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
                 if valid && ingest - ts > DAY {
                     valid = false;
                 }
-                let h = hash_bytes(eid);
-                parts[part_of(h)].push(EvRec { eid, user, ingest, ts, price, cat, valid });
+                let eh = h2(eid);
+                let (uh, uptr, rel) = if valid { (h2(user), pack(user), (ts - ctx.base) as u32) } else { (H2::default(), 0, 0) };
+                parts[part2(eh)].push(EvRec { eid: eh, user: uh, uptr, ingest, rel, price, cat, valid });
             });
             parts
         })
         .collect()
 }
 
-fn dedup_partition(
-    chunks: &[Vec<Vec<EvRec>>],
-    p: usize,
-    ctx: &Ctx,
-    linkmap: &HashMap<Bytes, Bytes>,
-    out: &mut [Vec<PEv>],
-) {
+fn dedup_partition(chunks: &[Vec<Vec<EvRec>>], p: usize, linkmap: &LinkMap, out: &mut [Vec<PEv>]) {
     let n: usize = chunks.iter().map(|c| c[p].len()).sum();
     let mut recs: Vec<EvRec> = Vec::with_capacity(n);
     for c in chunks {
@@ -631,8 +681,7 @@ fn dedup_partition(
     let mut keep = vec![true; n];
     for i in 0..n {
         let r = &recs[i];
-        let h = hash_bytes(r.eid);
-        match table.entry(h, |&j| recs[j as usize].eid == r.eid, |&j| hash_bytes(recs[j as usize].eid)) {
+        match table.entry(r.eid.lo, |&j| recs[j as usize].eid == r.eid, |&j| recs[j as usize].eid.lo) {
             hashbrown::hash_table::Entry::Occupied(mut o) => {
                 let j = *o.get() as usize;
                 if r.ingest < recs[j].ingest {
@@ -648,22 +697,18 @@ fn dedup_partition(
         }
     }
     for i in 0..n {
-        if !keep[i] {
-            continue;
-        }
         let r = &recs[i];
-        if !r.valid {
+        if !keep[i] || !r.valid {
             continue;
         }
-        let name = *linkmap.get(r.user).unwrap_or(&r.user);
-        let h = hash_bytes(name);
-        out[part_of(h)].push(PEv { name, hash: h, rel: (r.ts - ctx.base) as u32, price: r.price, cat: r.cat });
+        let (ph, pptr) = linkmap.resolve(r.user, r.uptr);
+        out[part2(ph)].push(PEv { ph, pptr, rel: r.rel, price: r.price, cat: r.cat });
     }
 }
 
 // ---------------------------------------------------------------- clicks
 
-fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &HashMap<Bytes, Bytes>) -> Vec<Vec<Vec<PCl>>> {
+fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &LinkMap) -> Vec<Vec<Vec<PCl>>> {
     let chunks = chunks_of(files, 8 << 20);
     chunks
         .par_iter()
@@ -686,9 +731,8 @@ fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &HashMap<Bytes, Bytes>) -
                     Some(&c) => c,
                     None => return,
                 };
-                let name = *linkmap.get(user).unwrap_or(&user);
-                let h = hash_bytes(name);
-                parts[part_of(h)].push(PCl { name, hash: h, rel: (ts - ctx.base) as u32, camp, cid });
+                let (ph, _) = linkmap.resolve(h2(user), 0);
+                parts[part2(ph)].push(PCl { ph, cid: pack(cid), rel: (ts - ctx.base) as u32, camp });
             });
             parts
         })
@@ -722,26 +766,25 @@ fn process_person_partition(
     stamp: &mut [u32],
     stamp_ctr: &mut u32,
 ) {
-    // intern persons
+    // intern persons by 128-bit hash
     let mut table: HashTable<u32> = HashTable::new();
+    let mut names_h: Vec<H2> = Vec::new();
     let mut names: Vec<Bytes> = Vec::new();
-    let mut intern = |name: Bytes, h: u64, names: &mut Vec<Bytes>| -> u32 {
-        match table.entry(h, |&j| names[j as usize] == name, |&j| hash_bytes(names[j as usize])) {
-            hashbrown::hash_table::Entry::Occupied(o) => *o.get(),
-            hashbrown::hash_table::Entry::Vacant(v) => {
-                names.push(name);
-                let id = (names.len() - 1) as u32;
-                v.insert(id);
-                id
-            }
-        }
-    };
     let ne: usize = ev_person.iter().map(|v| v[p].len()).sum();
     // (key = pid<<32 | rel, price, cat)
     let mut evs: Vec<(u64, u32, u16)> = Vec::with_capacity(ne);
     for v in ev_person {
         for e in &v[p] {
-            let pid = intern(e.name, e.hash, &mut names);
+            let pid = match table.entry(e.ph.lo, |&j| names_h[j as usize] == e.ph, |&j| names_h[j as usize].lo) {
+                hashbrown::hash_table::Entry::Occupied(o) => *o.get(),
+                hashbrown::hash_table::Entry::Vacant(v) => {
+                    let id = names_h.len() as u32;
+                    names_h.push(e.ph);
+                    names.push(unpack(e.pptr));
+                    v.insert(id);
+                    id
+                }
+            };
             evs.push(((pid as u64) << 32 | e.rel as u64, e.price, e.cat));
         }
     }
@@ -750,8 +793,8 @@ fn process_person_partition(
     for v in click_parts {
         for c in &v[p] {
             // only persons that have events matter
-            if let Some(&pid) = table.find(c.hash, |&j| names[j as usize] == c.name) {
-                cls.push(((pid as u64) << 32 | c.rel as u64, c.cid, c.camp));
+            if let Some(&pid) = table.find(c.ph.lo, |&j| names_h[j as usize] == c.ph) {
+                cls.push(((pid as u64) << 32 | c.rel as u64, unpack(c.cid), c.camp));
             }
         }
     }

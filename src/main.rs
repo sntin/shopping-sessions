@@ -608,16 +608,6 @@ fn unpack(x: u64) -> Bytes {
     unsafe { std::slice::from_raw_parts((x & 0xFFFF_FFFF_FFFF) as *const u8, (x >> 48) as usize) }
 }
 
-#[derive(Clone, Copy)]
-#[repr(C, packed(4))]
-struct EvRec {
-    eid_lo: u64, // event_id hash (partition comes from the independent high hash word)
-    user: u64,   // user_id hash
-    uptr: u64,   // packed user_id slice
-    ingest: u32, // seconds since epoch (ingest_ts is always whole-second F1)
-    rel: u32,    // ts - (ws - 7d); u32::MAX = invalid event
-    pc: u32,     // price << 8 | category; price 0 = not a purchase
-}
 const INVALID: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
@@ -712,30 +702,27 @@ fn main() {
     let link_thread = std::thread::spawn(move || {
         let lm = build_links(&ln_files);
         eprintln!("[{:?}] links done ({} remapped ids)", t0.elapsed(), lm.len);
-        lm
+        let _ = LINKS.set(lm);
     });
-    let ev_kept = parse_events(&ev_files, &ctx);
+    let ev_chunks = parse_events(&ev_files, &ctx);
     eprintln!("[{:?}] events parsed", t0.elapsed());
-    let linkmap = link_thread.join().unwrap();
+    link_thread.join().unwrap();
+    let linkmap = LINKS.get().unwrap();
     let click_parts = parse_clicks(&cl_files, &ctx, &linkmap);
     eprintln!("[{:?}] clicks parsed", t0.elapsed());
 
-    // ---- stage 2: dedup each eid partition, resolve person, repartition by person
-    // transpose chunk-major -> partition-major so each partition's input is freed after use
-    let mut by_part: Vec<Vec<Vec<EvRec>>> = (0..P).map(|_| Vec::with_capacity(ev_kept.len())).collect();
-    for chunk in ev_kept {
-        for (p, v) in chunk.into_iter().enumerate() {
-            by_part[p].push(v);
+    // ---- stage 2: dedup each event partition; losers are marked per person partition
+    let lost_lists: Vec<Vec<u32>> = (0..P).into_par_iter().map(|q| dedup_partition(q, &ev_chunks)).collect();
+    let nchunks = ev_chunks.len();
+    let mut lost_by_p: Vec<Vec<u32>> = vec![Vec::new(); P];
+    for l in &lost_lists {
+        for &loc in l {
+            lost_by_p[(loc >> 14 & 0xFF) as usize].push(loc);
         }
     }
-    let ev_person: Vec<Vec<Vec<PEv>>> = by_part
-        .into_par_iter()
-        .map(|chunks| {
-            let mut out: Vec<Vec<PEv>> = (0..P).map(|_| Vec::new()).collect();
-            dedup_partition(chunks, &linkmap, &mut out);
-            out
-        })
-        .collect();
+    drop(lost_lists);
+    let ev_person: Vec<Vec<Vec<PEv>>> = ev_chunks.into_iter().map(|c| c.pev).collect();
+    let _ = nchunks;
     eprintln!("[{:?}] dedup done", t0.elapsed());
 
     // ---- stage 3: per person partition: sessionize, attribute, aggregate
@@ -760,6 +747,7 @@ fn main() {
                 process_person_partition(
                     p,
                     &ev_person,
+                    &lost_by_p[p],
                     &click_parts,
                     ws_day,
                     base,
@@ -857,28 +845,60 @@ impl LinkMap {
     }
 }
 
+/// Big-endian 8-byte prefix: comparing (prefix, then full bytes on a tie) is byte-wise order.
+#[inline(always)]
+fn name_pfx(b: &[u8]) -> u64 {
+    let mut x = [0u8; 8];
+    let n = b.len().min(8);
+    x[..n].copy_from_slice(&b[..n]);
+    u64::from_be_bytes(x)
+}
+
+#[inline(always)]
+fn name_lt_eq(pa: u64, a: u64, pb: u64, b: u64) -> bool {
+    if pa != pb {
+        return pa < pb;
+    }
+    unpack(a) <= unpack(b)
+}
+
 fn build_links(files: &[PathBuf]) -> LinkMap {
     let datas: Vec<Bytes> = files.iter().map(|p| leak_mmap(p)).collect();
     let chunks: Vec<Bytes> = datas
         .into_iter()
         .filter_map(|d| memchr::memchr(b'\n', d).map(|i| &d[i + 1..]))
         .collect();
-    let pairs: Vec<Vec<(u64, u64, u64, u64)>> = chunks
-        .iter()
-        .map(|c| {
-            let mut v = Vec::new();
-            for_each_record::<2>(c, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((h1(f[0]), pack(f[0]), h1(f[1]), pack(f[1])));
-                }
-            });
-            v
-        })
-        .collect();
+    // parse on a few scoped threads (the rayon pool is busy with events)
+    type Pair = (u64, u64, u64, u64, u64, u64);
+    let nt = 4usize.min(chunks.len().max(1));
+    let pairs: Vec<Vec<Pair>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt)
+            .map(|t| {
+                let chunks = &chunks;
+                sc.spawn(move || {
+                    let mut v: Vec<Pair> = Vec::new();
+                    for c in chunks.iter().skip(t).step_by(nt) {
+                        for_each_record::<2>(c, |f| {
+                            if !f[0].is_empty() && !f[1].is_empty() {
+                                v.push((h1(f[0]), pack(f[0]), name_pfx(f[0]), h1(f[1]), pack(f[1]), name_pfx(f[1])));
+                            }
+                        });
+                    }
+                    v
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
     let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let mut table: HashTable<u32> = HashTable::with_capacity(total + 16);
+    // intern IDs: open addressing on the hash, slot = id + 1
+    let cap = (total * 2 + 16).next_power_of_two();
+    let mask = cap - 1;
+    let mut slots: Vec<u32> = vec![0; cap];
+    let slots_ptr = slots.as_ptr() as usize;
     let mut id_h: Vec<u64> = Vec::with_capacity(total + 16);
     let mut id_ptr: Vec<u64> = Vec::with_capacity(total + 16);
+    let mut id_pfx: Vec<u64> = Vec::with_capacity(total + 16);
     let mut parent: Vec<u32> = Vec::with_capacity(total + 16);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
@@ -888,31 +908,45 @@ fn build_links(files: &[PathBuf]) -> LinkMap {
         }
         x
     }
-    let mut intern = |h: u64, ptr: u64, id_h: &mut Vec<u64>, id_ptr: &mut Vec<u64>, parent: &mut Vec<u32>| -> u32 {
-        match table.entry(h, |&j| id_h[j as usize] == h, |&j| id_h[j as usize]) {
-            hashbrown::hash_table::Entry::Occupied(o) => *o.get(),
-            hashbrown::hash_table::Entry::Vacant(v) => {
+    let mut intern = |h: u64, ptr: u64, pfx: u64, id_h: &mut Vec<u64>, id_ptr: &mut Vec<u64>, id_pfx: &mut Vec<u64>, parent: &mut Vec<u32>| -> u32 {
+        let mut i = (h >> 20) as usize & mask;
+        loop {
+            let e = slots[i];
+            if e == 0 {
                 let id = id_h.len() as u32;
                 id_h.push(h);
                 id_ptr.push(ptr);
+                id_pfx.push(pfx);
                 parent.push(id);
-                v.insert(id);
-                id
+                slots[i] = id + 1;
+                return id;
             }
+            if id_h[(e - 1) as usize] == h {
+                return e - 1;
+            }
+            i = (i + 1) & mask;
         }
     };
     for v in &pairs {
-        for &(ha, pa, hb, pb) in v {
-            let ia = intern(ha, pa, &mut id_h, &mut id_ptr, &mut parent);
-            let ib = intern(hb, pb, &mut id_h, &mut id_ptr, &mut parent);
+        for (k, &(ha, pa, xa, hb, pb, xb)) in v.iter().enumerate() {
+            if k + 8 < v.len() {
+                let n = &v[k + 8];
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch((slots_ptr as *const u32).add((n.0 >> 20) as usize & mask) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                    std::arch::x86_64::_mm_prefetch((slots_ptr as *const u32).add((n.3 >> 20) as usize & mask) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                }
+            }
+            let ia = intern(ha, pa, xa, &mut id_h, &mut id_ptr, &mut id_pfx, &mut parent);
+            let ib = intern(hb, pb, xb, &mut id_h, &mut id_ptr, &mut id_pfx, &mut parent);
             let ra = find(&mut parent, ia);
             let rb = find(&mut parent, ib);
             if ra != rb {
                 // the root always holds the byte-wise smallest name of its set
-                if unpack(id_ptr[ra as usize]) <= unpack(id_ptr[rb as usize]) {
-                    parent[rb as usize] = ra;
+                let (ra_, rb_) = (ra as usize, rb as usize);
+                if name_lt_eq(id_pfx[ra_], id_ptr[ra_], id_pfx[rb_], id_ptr[rb_]) {
+                    parent[rb_] = ra;
                 } else {
-                    parent[ra as usize] = rb;
+                    parent[ra_] = rb;
                 }
             }
         }
@@ -938,32 +972,85 @@ fn build_links(files: &[PathBuf]) -> LinkMap {
 
 // ---------------------------------------------------------------- events
 
-fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
-    let chunks = chunks_of(files, 8 << 20);
-    if let Ok(b) = std::env::var("SS_BENCH") {
-        let b: u32 = b.parse().unwrap();
-        let t = Instant::now();
-        let x: u64 = chunks.par_iter().map(|c| {
-            let mut acc = 0u64;
-            if b == 0 { for &x in c.iter() { acc += x as u64; } return acc; }
-            for_each_record::<7>(c, |f| {
-                acc += f[0].len() as u64;
-                if b >= 2 { acc += parse_ts(f[2]).unwrap_or(0) as u64 + parse_ts(f[3]).unwrap_or(0) as u64; }
-                if b >= 3 { acc += h2(f[0]).lo + h2(f[1]).lo; }
-            });
-            acc
-        }).sum();
-        eprintln!("bench {} {:?} {}", b, t.elapsed(), x);
-        std::process::exit(0);
+/// Event parsed but not yet placed: kept in a per-thread buffer until the link map is ready.
+#[derive(Clone, Copy)]
+struct LRec {
+    eid_lo: u64,
+    user: u64,
+    uptr: u64,
+    eid_part: u32,
+    ingest: u32,
+    rel: u32,
+    pc: u32,
+}
+
+/// Dedup record: event hash, ingest second, and where its person record went
+/// (chunk << 22 | person partition << 14 | index), or NOLOC for an invalid event.
+#[derive(Clone, Copy)]
+struct DRec {
+    eid_lo: u64,
+    ingest: u32,
+    loc: u32,
+}
+const NOLOC: u32 = u32::MAX;
+
+struct EvChunk {
+    pev: Vec<Vec<PEv>>,  // by person partition
+    drec: Vec<Vec<DRec>>, // by event partition
+}
+
+static LINKS: std::sync::OnceLock<LinkMap> = std::sync::OnceLock::new();
+
+/// Resolve persons for a parsed chunk and scatter it: person records by person partition,
+/// dedup records by event partition.
+fn place_chunk(ci: usize, buf: &[LRec], linkmap: &LinkMap) -> EvChunk {
+    let n = buf.len();
+    let mut pev: Vec<Vec<PEv>> = (0..P).map(|_| Vec::with_capacity(part_cap(n))).collect();
+    let mut drec: Vec<Vec<DRec>> = (0..P).map(|_| Vec::with_capacity(part_cap(n))).collect();
+    const AHEAD: usize = 16;
+    for x in 0..n {
+        if x + AHEAD < n {
+            let r2 = &buf[x + AHEAD];
+            if r2.rel != INVALID {
+                linkmap.prefetch(r2.user);
+            }
+        }
+        let r = &buf[x];
+        let mut loc = NOLOC;
+        if r.rel != INVALID {
+            let (ph, pptr) = linkmap.resolve(r.user, r.uptr);
+            let p = part1(ph);
+            let v = &mut pev[p];
+            assert!(v.len() < (1 << 14));
+            loc = (ci as u32) << 22 | (p as u32) << 14 | v.len() as u32;
+            v.push(PEv { ph, pptr, rel: r.rel, pc: r.pc });
+        }
+        drec[r.eid_part as usize].push(DRec { eid_lo: r.eid_lo, ingest: r.ingest, loc });
     }
-    chunks
+    EvChunk { pev, drec }
+}
+
+fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<EvChunk> {
+    let total: usize = files.iter().map(|f| fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0)).sum();
+    let chunks = chunks_of(files, (8 << 20).max(total / 1000 + 1));
+    assert!(chunks.len() < 1024);
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<LRec>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    enum Out {
+        Done(EvChunk),
+        Later(Vec<LRec>),
+    }
+    let outs: Vec<Out> = chunks
         .par_iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(ci, c)| {
             populate(c);
-            let mut parts: Vec<Vec<EvRec>> = (0..P).map(|_| Vec::with_capacity(part_cap(c.len() / 76))).collect();
-            let nopush = std::env::var("SS_NOPUSH").is_ok();
-            let mut acc_np = 0u64;
-            for_each_record::<7>(c, |f| {
+            BUF.with(|b| {
+                let mut buf = b.borrow_mut();
+                buf.clear();
+                buf.reserve(c.len() / 40);
+                for_each_record::<7>(c, |f| {
                 let eid = f[0];
                 if eid.is_empty() {
                     return;
@@ -1010,42 +1097,52 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
                 let eh = h2(eid);
                 let (uh, uptr, rel) = if valid { (h1(user), pack(user), (ts - ctx.base) as u32) } else { (0, 0, INVALID) };
                 let ingest = match ingest_s { Some(t) => t.clamp(0, u32::MAX as i64 - 1) as u32, None => u32::MAX };
-                if nopush { acc_np = acc_np.wrapping_add(eh.lo ^ uh ^ uptr ^ rel as u64); return; }
-                parts[part2(eh)].push(EvRec {
-                    eid_lo: eh.lo,
-                    user: uh,
-                    uptr,
-                    ingest,
-                    rel,
-                    pc: (price << 8) | cat as u32,
+                buf.push(LRec { eid_lo: eh.lo, user: uh, uptr, eid_part: part2(eh) as u32, ingest, rel, pc: (price << 8) | cat as u32 });
                 });
-            });
-            if nopush { eprint!("{}", acc_np & 1); }
-            parts
+                match LINKS.get() {
+                    Some(lm) => Out::Done(place_chunk(ci, &buf, lm)),
+                    None => Out::Later(std::mem::take(&mut *buf)),
+                }
+            })
         })
-        .collect()
+        .collect();
+    let nlater = outs.iter().filter(|o| matches!(o, Out::Later(_))).count();
+    let lm = {
+        while LINKS.get().is_none() {
+            std::thread::yield_now();
+        }
+        LINKS.get().unwrap()
+    };
+    let res: Vec<EvChunk> = outs
+        .into_par_iter()
+        .enumerate()
+        .map(|(ci, o)| match o {
+            Out::Done(e) => e,
+            Out::Later(buf) => place_chunk(ci, &buf, lm),
+        })
+        .collect();
+    eprintln!("  ({} of {} chunks placed after links)", nlater, res.len());
+    res
 }
 
 thread_local! {
     static DEDUP_TABLE: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PEv>]) {
-    let n: usize = chunks.iter().map(|c| c.len()).sum();
+/// Dedup one event partition; returns the person-record locations of the copies that lost.
+fn dedup_partition(q: usize, ev: &[EvChunk]) -> Vec<u32> {
+    let n: usize = ev.iter().map(|c| c.drec[q].len()).sum();
     assert!(n < (1 << 24));
-    // flat index -> record, for the rare tag matches
-    let mut offs: Vec<usize> = Vec::with_capacity(chunks.len() + 1);
+    let mut offs: Vec<usize> = Vec::with_capacity(ev.len() + 1);
     offs.push(0);
-    for c in &chunks {
-        offs.push(offs.last().unwrap() + c.len());
+    for c in ev {
+        offs.push(offs.last().unwrap() + c.drec[q].len());
     }
-    let get = |j: usize| -> &EvRec {
+    let get = |j: usize| -> &DRec {
         let ci = offs.partition_point(|&o| o <= j) - 1;
-        &chunks[ci][j - offs[ci]]
+        &ev[ci].drec[q][j - offs[ci]]
     };
-    // losers bitset
-    let mut lose = vec![0u64; n / 64 + 1];
-    // open addressing: slot = eid_lo & mask, entry = (eid_lo >> 24) << 24 | (index + 1)
+    let mut lost: Vec<u32> = Vec::new();
     DEDUP_TABLE.with(|t| {
         let mut t = t.borrow_mut();
         let size = (n * 2).next_power_of_two().max(1024);
@@ -1055,7 +1152,8 @@ fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PE
         let t = &mut t[..];
         let mut i = 0usize;
         const AHEAD: usize = 8;
-        for c in &chunks {
+        for c in ev {
+            let c = &c.drec[q];
             let m = c.len();
             for x in 0..m {
                 if x + AHEAD < m {
@@ -1076,12 +1174,15 @@ fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PE
                     if e >> 24 == tag {
                         let j = (e & 0xFF_FFFF) as usize - 1;
                         let rj = get(j);
-                        if { rj.eid_lo } == { r.eid_lo } {
+                        if rj.eid_lo == h {
+                            // copies with equal ingest are identical: keep the first
                             if r.ingest < rj.ingest {
-                                lose[j / 64] |= 1 << (j % 64);
+                                if rj.loc != NOLOC {
+                                    lost.push(rj.loc);
+                                }
                                 unsafe { *t.get_unchecked_mut(slot) = entry };
-                            } else {
-                                lose[i / 64] |= 1 << (i % 64);
+                            } else if r.loc != NOLOC {
+                                lost.push(r.loc);
                             }
                             break;
                         }
@@ -1092,31 +1193,7 @@ fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PE
             }
         }
     });
-    let cap = part_cap(n);
-    for o in out.iter_mut() {
-        o.reserve(cap);
-    }
-    const AHEAD: usize = 16;
-    let mut i = 0usize;
-    for c in &chunks {
-        let m = c.len();
-        for x in 0..m {
-            if x + AHEAD < m {
-                let r2 = &c[x + AHEAD];
-                if r2.rel != INVALID {
-                    linkmap.prefetch(r2.user);
-                }
-            }
-            let r = &c[x];
-            let kp = lose[i / 64] >> (i % 64) & 1 == 0;
-            i += 1;
-            if !kp || r.rel == INVALID {
-                continue;
-            }
-            let (ph, pptr) = linkmap.resolve(r.user, r.uptr);
-            out[part1(ph)].push(PEv { ph, pptr, rel: r.rel, pc: r.pc });
-        }
-    }
+    lost
 }
 
 // ---------------------------------------------------------------- clicks
@@ -1180,6 +1257,7 @@ struct UserRows {
 fn process_person_partition(
     p: usize,
     ev_person: &[Vec<Vec<PEv>>],
+    lost: &[u32],
     click_parts: &[Vec<Vec<PCl>>],
     ws_day: i64,
     base: i64,
@@ -1195,11 +1273,30 @@ fn process_person_partition(
     let mut table: HashTable<u32> = HashTable::new();
     let mut names_h: Vec<u64> = Vec::new();
     let mut names: Vec<Bytes> = Vec::new();
-    let ne: usize = ev_person.iter().map(|v| v[p].len()).sum();
-    let mut epid: Vec<u32> = Vec::with_capacity(ne);
+    // flat index of each chunk's slice, and the losers of dedup as a bitset over it
+    let mut offs: Vec<u32> = Vec::with_capacity(ev_person.len() + 1);
+    offs.push(0);
+    for v in ev_person {
+        offs.push(offs.last().unwrap() + v[p].len() as u32);
+    }
+    let ntot = *offs.last().unwrap() as usize;
+    let mut lose = vec![0u64; ntot / 64 + 1];
+    for &loc in lost {
+        let f = offs[(loc >> 22) as usize] as usize + (loc & 0x3FFF) as usize;
+        lose[f / 64] |= 1 << (f % 64);
+    }
+    let ne = ntot - lost.len();
+    let mut epid: Vec<u32> = Vec::with_capacity(ntot);
     let mut ecnt: Vec<u32> = Vec::new();
+    let mut fidx = 0usize;
     for v in ev_person {
         for e in &v[p] {
+            let f = fidx;
+            fidx += 1;
+            if lose[f / 64] >> (f % 64) & 1 != 0 {
+                epid.push(u32::MAX);
+                continue;
+            }
             let pid = match table.entry(e.ph, |&j| names_h[j as usize] == e.ph, |&j| names_h[j as usize]) {
                 hashbrown::hash_table::Entry::Occupied(o) => *o.get(),
                 hashbrown::hash_table::Entry::Vacant(v) => {
@@ -1230,6 +1327,9 @@ fn process_person_partition(
             for e in &v[p] {
                 let pid = epid[x] as usize;
                 x += 1;
+                if pid == u32::MAX as usize {
+                    continue;
+                }
                 dst[pos[pid] as usize].write((e.rel as u64) << 32 | e.pc as u64);
                 pos[pid] += 1;
             }

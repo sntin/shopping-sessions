@@ -15,6 +15,9 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type Bytes = &'static [u8];
 
 const DAY: i64 = 86_400_000;
@@ -236,17 +239,48 @@ fn is_leap(y: u32) -> bool {
 }
 
 #[inline(always)]
+fn ld8(s: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
+}
+
+/// true if every byte of `x` selected by `mask` (0xFF per byte) is an ASCII digit,
+/// where `d = x ^ 0x30..30` holds the digit values.
+#[inline(always)]
+fn all_digits(d: u64, mask: u64) -> bool {
+    let hi = 0x8080_8080_8080_8080u64 & mask;
+    ((d | d.wrapping_add(0x7676_7676_7676_7676)) & hi) == 0
+}
+
+#[inline(always)]
 fn parse_datetime(s: &[u8]) -> Option<i64> {
-    // YYYY-MM-DDTHH:MM:SS (first 19 bytes), caller checked len and s[10]=='T'
-    if s[4] != b'-' || s[7] != b'-' || s[13] != b':' || s[16] != b':' {
+    // YYYY-MM-DDTHH:MM:SS (first 19 bytes); caller guarantees len >= 20
+    let a = ld8(s, 0); // YYYY-MM-
+    let b = ld8(s, 8); // DDTHH:MM
+    let c = ld8(s, 11); // HH:MM:SS
+    // separators
+    const SA: u64 = 0xFF00_00FF_0000_0000; // bytes 4 and 7
+    const VA: u64 = (b'-' as u64) << 32 | (b'-' as u64) << 56;
+    const SB: u64 = 0xFF << 16; // byte 2 of b = s[10]
+    const VB: u64 = (b'T' as u64) << 16;
+    const SC: u64 = 0xFF << 16 | 0xFF << 40; // bytes 2 and 5 of c
+    const VC: u64 = (b':' as u64) << 16 | (b':' as u64) << 40;
+    if (a & SA) != VA || (b & SB) != VB || (c & SC) != VC {
         return None;
     }
-    let y = d2(s, 0)? * 100 + d2(s, 2)?;
-    let mo = d2(s, 5)?;
-    let d = d2(s, 8)?;
-    let h = d2(s, 11)?;
-    let mi = d2(s, 14)?;
-    let se = d2(s, 17)?;
+    const Z: u64 = 0x3030_3030_3030_3030;
+    let da = a ^ Z;
+    let db = b ^ Z;
+    let dc = c ^ Z;
+    if !all_digits(da, !SA) || !all_digits(db, 0xFFFF) || !all_digits(dc, !SC) {
+        return None;
+    }
+    let by = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as u32;
+    let y = by(da, 0) * 1000 + by(da, 1) * 100 + by(da, 2) * 10 + by(da, 3);
+    let mo = by(da, 5) * 10 + by(da, 6);
+    let d = by(db, 0) * 10 + by(db, 1);
+    let h = by(dc, 0) * 10 + by(dc, 1);
+    let mi = by(dc, 3) * 10 + by(dc, 4);
+    let se = by(dc, 6) * 10 + by(dc, 7);
     if mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
@@ -261,7 +295,6 @@ fn parse_datetime(s: &[u8]) -> Option<i64> {
         return None;
     }
     let days = if (1900..2200).contains(&y) {
-        // table lookup: days before Jan 1 of y, plus cumulative month days
         const CUM: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
         YEAR_START.get_or_init(|| (1900..2200).map(|yy| days_from_civil(yy, 1, 1) as i32).collect::<Vec<i32>>())
             [(y - 1900) as usize] as i64
@@ -792,6 +825,22 @@ fn build_links(files: &[PathBuf]) -> LinkMap {
 
 fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
     let chunks = chunks_of(files, 8 << 20);
+    if let Ok(b) = std::env::var("SS_BENCH") {
+        let b: u32 = b.parse().unwrap();
+        let t = Instant::now();
+        let x: u64 = chunks.par_iter().map(|c| {
+            let mut acc = 0u64;
+            if b == 0 { for &x in c.iter() { acc += x as u64; } return acc; }
+            for_each_record::<7>(c, |f| {
+                acc += f[0].len() as u64;
+                if b >= 2 { acc += parse_ts(f[2]).unwrap_or(0) as u64 + parse_ts(f[3]).unwrap_or(0) as u64; }
+                if b >= 3 { acc += h2(f[0]).lo + h2(f[1]).lo; }
+            });
+            acc
+        }).sum();
+        eprintln!("bench {} {:?} {}", b, t.elapsed(), x);
+        std::process::exit(0);
+    }
     chunks
         .par_iter()
         .map(|c| {
@@ -819,9 +868,15 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
                 };
                 let mut price = 0u32;
                 let mut cat = 0u16;
-                match f[4] {
-                    b"view" | b"cart" => {}
-                    b"purchase" => match parse_price(f[6]) {
+                let et = f[4];
+                let is_vc = et.len() == 4 && {
+                    let w = u32::from_le_bytes(et[..4].try_into().unwrap());
+                    w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart")
+                };
+                let is_p = et.len() == 8 && u64::from_le_bytes(et[..8].try_into().unwrap()) == u64::from_le_bytes(*b"purchase");
+                match (is_vc, is_p) {
+                    (true, _) => {}
+                    (_, true) => match parse_price(f[6]) {
                         Some(p) => {
                             price = p;
                             cat = *ctx.products.get(f[5]).unwrap_or(&ctx.unknown_cat);

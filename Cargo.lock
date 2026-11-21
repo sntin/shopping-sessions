@@ -595,6 +595,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "hashbrown 0.15.5",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

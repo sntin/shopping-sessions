@@ -169,21 +169,24 @@ fn for_each_record<const N: usize>(chunk: Bytes, mut f: impl FnMut(&[Bytes; N]))
             }
         } else {
             let mut qf = 0u32;
+            let mut bad = 0u32;
             for i in 0..N {
                 let e = pos[i] as usize;
-                let mut fl = unsafe { chunk.get_unchecked(st..e) };
-                if !fl.is_empty() && fl[0] == b'"' {
-                    let l = fl.len();
-                    if l < 2 || fl[l - 1] != b'"' {
-                        return;
-                    }
-                    fl = &fl[1..l - 1];
-                    qf += 1;
-                }
-                fields[i] = fl;
+                let len = e - st;
+                let (first, last) = if len > 0 {
+                    unsafe { (*chunk.get_unchecked(st), *chunk.get_unchecked(e - 1)) }
+                } else {
+                    (0, 0)
+                };
+                let q = (first == b'"') as usize;
+                bad |= (q as u32) & ((len < 2) as u32 | (last != b'"') as u32);
+                let s2 = st + q;
+                let e2 = (e - q).max(s2);
+                fields[i] = unsafe { chunk.get_unchecked(s2..e2) };
+                qf += q as u32;
                 st = e + 1;
             }
-            if quotes != 2 * qf {
+            if (bad != 0) | (quotes != 2 * qf) {
                 return;
             }
         }

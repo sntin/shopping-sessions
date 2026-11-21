@@ -593,8 +593,8 @@ struct Ctx {
 
 fn main() {
     let t0 = Instant::now();
-    // Transparent huge pages made run times erratic (compaction stalls); use 4K pages.
-    if std::env::var("SS_THP").is_err() {
+    // THP on (default) is ~8% faster with mimalloc purge disabled; SS_NOTHP=1 turns it off.
+    if std::env::var("SS_NOTHP").is_ok() {
         unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
     }
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));

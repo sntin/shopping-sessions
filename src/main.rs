@@ -699,14 +699,13 @@ fn main() {
     // ---- stage 1 (concurrently): links -> name map, clicks parse; events parse + dedup
     // links run on a dedicated thread (small input, sequential union-find) while all
     // pool threads parse events.
-    let link_thread = std::thread::spawn(move || {
-        let lm = build_links(&ln_files);
+    {
+        let lm = if std::env::var_os("SS_OLDLINKS").is_some() { build_links(&ln_files) } else { build_links_par(&ln_files) };
         eprintln!("[{:?}] links done ({} remapped ids)", t0.elapsed(), lm.len);
         let _ = LINKS.set(lm);
-    });
+    }
     let ev_chunks = parse_events(&ev_files, &ctx);
     eprintln!("[{:?}] events parsed", t0.elapsed());
-    link_thread.join().unwrap();
     let linkmap = LINKS.get().unwrap();
     let click_parts = parse_clicks(&cl_files, &ctx, &linkmap);
     eprintln!("[{:?}] clicks parsed", t0.elapsed());
@@ -860,6 +859,185 @@ fn name_lt_eq(pa: u64, a: u64, pb: u64, b: u64) -> bool {
         return pa < pb;
     }
     unpack(a) <= unpack(b)
+}
+
+/// A Vec of n zero-initialized T (T must be valid as all-zero bytes). Fresh allocator
+/// memory is already zero, so this avoids touching every page up front.
+fn zeroed_vec<T>(n: usize) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<T>(n).unwrap();
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout) as *mut T;
+        assert!(!p.is_null());
+        Vec::from_raw_parts(p, n, n)
+    }
+}
+
+/// Parallel link building (all pool threads): concurrent intern table, lock-free
+/// union-find where a root is always the byte-wise smallest name of its set, and a
+/// parallel fill of the link map.
+fn build_links_par(files: &[PathBuf]) -> LinkMap {
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+
+    let chunks = chunks_of(files, 1 << 20);
+    let pairs: Vec<Vec<(u64, u64, u64, u64, u64, u64)>> = chunks
+        .par_iter()
+        .map(|c| {
+            let mut v = Vec::with_capacity(c.len() / 20);
+            for_each_record::<2>(c, |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
+                    v.push((h1(f[0]).max(1), pack(f[0]), name_pfx(f[0]), h1(f[1]).max(1), pack(f[1]), name_pfx(f[1])));
+                }
+            });
+            v
+        })
+        .collect();
+    let total: usize = pairs.iter().map(|v| v.len()).sum();
+    if total == 0 {
+        return LinkMap::build(std::iter::empty(), 0);
+    }
+    // intern: one packed slot per entry, (hash >> 24) << 24 | (id + 1); the full hash is
+    // checked in id_h. Ids come from a counter; a lost race leaves an unused id (a hole).
+    let cap = (total * 3).next_power_of_two();
+    let mask = cap - 1;
+    let slots_t: Vec<AtomicU64> = zeroed_vec(cap);
+    const IDB: usize = 1024; // ids handed out in blocks per task
+    let maxn = total * 2 + (pairs.len() + 1) * IDB;
+    assert!(maxn < (1 << 24));
+    let id_h: Vec<AtomicU64> = zeroed_vec(maxn);
+    let id_ptr: Vec<AtomicU64> = zeroed_vec(maxn);
+    let id_pfx: Vec<AtomicU64> = zeroed_vec(maxn);
+    let next = AtomicUsize::new(0);
+    let intern = |h: u64, ptr: u64, pfx: u64, blk: &mut (usize, usize)| -> u32 {
+        let tag = (h >> 24) << 24;
+        let mut i = (h >> 20) as usize & mask;
+        let mut mine: Option<usize> = None;
+        loop {
+            let e = slots_t[i].load(Acquire);
+            if e == 0 {
+                let id = *mine.get_or_insert_with(|| {
+                    if blk.0 == blk.1 {
+                        let b = next.fetch_add(IDB, Relaxed);
+                        *blk = (b, b + IDB);
+                    }
+                    let id = blk.0;
+                    blk.0 += 1;
+                    id_h[id].store(h, Relaxed);
+                    id_ptr[id].store(ptr, Relaxed);
+                    id_pfx[id].store(pfx, Relaxed);
+                    id
+                });
+                match slots_t[i].compare_exchange(0, tag | (id as u64 + 1), AcqRel, Acquire) {
+                    Ok(_) => return id as u32,
+                    Err(_) => continue, // re-examine this slot
+                }
+            }
+            if e & !0xFF_FFFF == tag {
+                let id = (e & 0xFF_FFFF) as usize - 1;
+                if id_h[id].load(Relaxed) == h {
+                    if let Some(m) = mine {
+                        id_h[m].store(0, Relaxed); // hole
+                    }
+                    return id as u32;
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    };
+    let prefetch = |h: u64| unsafe {
+        std::arch::x86_64::_mm_prefetch(slots_t.as_ptr().add((h >> 20) as usize & mask) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    };
+    let idpairs: Vec<Vec<(u32, u32)>> = pairs
+        .par_iter()
+        .map(|v| {
+            let mut out = Vec::with_capacity(v.len());
+            let mut blk = (0usize, 0usize);
+            for k in 0..v.len() {
+                if k + 8 < v.len() {
+                    prefetch(v[k + 8].0);
+                    prefetch(v[k + 8].3);
+                }
+                let (ha, pa, xa, hb, pb, xb) = v[k];
+                out.push((intern(ha, pa, xa, &mut blk), intern(hb, pb, xb, &mut blk)));
+            }
+            out
+        })
+        .collect();
+    drop(slots_t);
+    let n = next.load(SeqCst);
+    let id_h: Vec<u64> = id_h.into_iter().take(n).map(|x| x.into_inner()).collect();
+    let id_ptr: Vec<u64> = id_ptr.into_iter().take(n).map(|x| x.into_inner()).collect();
+    let id_pfx: Vec<u64> = id_pfx.into_iter().take(n).map(|x| x.into_inner()).collect();
+    // strict total order on ids by name bytes (distinct ids have distinct names)
+    let less = |a: u32, b: u32| -> bool {
+        let (pa, pb) = (id_pfx[a as usize], id_pfx[b as usize]);
+        if pa != pb {
+            return pa < pb;
+        }
+        unpack(id_ptr[a as usize]) < unpack(id_ptr[b as usize])
+    };
+    let parent: Vec<AtomicU32> = (0..n as u32).into_par_iter().map(AtomicU32::new).collect();
+    let find = |mut x: u32| -> u32 {
+        loop {
+            let p = parent[x as usize].load(Relaxed);
+            if p == x {
+                return x;
+            }
+            let gp = parent[p as usize].load(Relaxed);
+            if gp != p {
+                // path halving: gp is an ancestor of x, so this store keeps the forest valid
+                parent[x as usize].store(gp, Relaxed);
+            }
+            x = gp;
+        }
+    };
+    idpairs.par_iter().for_each(|v| {
+        for &(a, b) in v {
+            loop {
+                let ra = find(a);
+                let rb = find(b);
+                if ra == rb {
+                    break;
+                }
+                // hang the larger name under the smaller; retry if the larger stopped being a root
+                let (big, small) = if less(ra, rb) { (rb, ra) } else { (ra, rb) };
+                if parent[big as usize].compare_exchange(big, small, AcqRel, Relaxed).is_ok() {
+                    break;
+                }
+            }
+        }
+    });
+    let root: Vec<u32> = (0..n as u32).into_par_iter().map(|i| find(i)).collect();
+    // holes (id_h == 0) are never linked, so they are their own roots and stay out of the map
+    let nonroot = root.par_iter().enumerate().filter(|&(i, &r)| r as usize != i).count();
+    // parallel fill of the link map
+    let cap = (nonroot * 2).next_power_of_two().max(16);
+    let lmask = cap - 1;
+    let slots: Vec<LinkSlot> = zeroed_vec(cap);
+    let base = slots.as_ptr() as usize;
+    (0..n).into_par_iter().for_each(|i| {
+        let r = root[i] as usize;
+        if r == i {
+            return;
+        }
+        let h = id_h[i];
+        let mut j = h as usize & lmask;
+        loop {
+            let sp = (base + j * std::mem::size_of::<LinkSlot>()) as *mut LinkSlot;
+            let hk = unsafe { &*(std::ptr::addr_of_mut!((*sp).h) as *const AtomicU64) };
+            if hk.compare_exchange(0, h, AcqRel, Acquire).is_ok() {
+                unsafe {
+                    (*sp).name_h = id_h[r];
+                    (*sp).name_ptr = id_ptr[r];
+                }
+                return;
+            }
+            j = (j + 1) & lmask;
+        }
+    });
+    LinkMap { slots, mask: lmask, len: nonroot }
 }
 
 fn build_links(files: &[PathBuf]) -> LinkMap {

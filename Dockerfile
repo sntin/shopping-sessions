@@ -3,8 +3,9 @@ FROM rust:1.91-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# Scorers are Intel Xeon (Cascade Lake or newer): AVX2/BMI2 are safe.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+COPY .cargo ./.cargo
+
+
 RUN cargo build --release --locked && strip target/release/ss
 
 FROM debian:bookworm-slim

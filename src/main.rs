@@ -14,6 +14,10 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 
+mod halloc;
+#[global_allocator]
+static GLOBAL: halloc::HugeAlloc = halloc::HugeAlloc;
+
 type Bytes = &'static [u8];
 
 const DAY: i64 = 86_400_000;
@@ -102,6 +106,108 @@ fn for_each_line(chunk: Bytes, mut f: impl FnMut(Bytes)) {
     }
     if pos < chunk.len() {
         f(&chunk[pos..]);
+    }
+}
+
+
+/// 64-byte block masks: (separator = ',' or '\n', quote, newline)
+#[inline(always)]
+fn block_masks(p: &[u8; 64]) -> (u64, u64, u64) {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let a = _mm256_loadu_si256(p.as_ptr() as *const __m256i);
+        let b = _mm256_loadu_si256(p.as_ptr().add(32) as *const __m256i);
+        let comma = _mm256_set1_epi8(b',' as i8);
+        let quote = _mm256_set1_epi8(b'"' as i8);
+        let nl = _mm256_set1_epi8(b'\n' as i8);
+        let m = |x: __m256i, c: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, c)) as u32 as u64;
+        let c = m(a, comma) | (m(b, comma) << 32);
+        let q = m(a, quote) | (m(b, quote) << 32);
+        let n = m(a, nl) | (m(b, nl) << 32);
+        (c | n, q, n)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let (mut c, mut q, mut n) = (0u64, 0u64, 0u64);
+        for i in 0..64 {
+            let x = p[i];
+            c |= ((x == b',') as u64) << i;
+            q |= ((x == b'"') as u64) << i;
+            n |= ((x == b'\n') as u64) << i;
+        }
+        (c | n, q, n)
+    }
+}
+
+/// Scan a chunk of complete lines and call `f` with the N fields of every well-formed line.
+#[inline(always)]
+fn for_each_record<const N: usize>(chunk: Bytes, mut f: impl FnMut(&[Bytes; N])) {
+    let n = chunk.len();
+    let mut fields: [Bytes; N] = [&[]; N];
+    let mut k = 0usize; // fields completed in current line
+    let mut bad = false;
+    let mut start = 0usize; // current field start
+    let mut qcount = 0u32;
+    let mut base = 0usize;
+    let mut tail = [0u8; 64];
+    // finish field ending at `pos` (exclusive)
+    macro_rules! end_field {
+        ($pos:expr) => {{
+            let pos = $pos;
+            if k < N {
+                let mut fl = &chunk[start..pos];
+                if qcount != 0 {
+                    let l = fl.len();
+                    if qcount != 2 || l < 2 || fl[0] != b'"' || fl[l - 1] != b'"' {
+                        bad = true;
+                    } else {
+                        fl = &fl[1..l - 1];
+                    }
+                }
+                fields[k] = fl;
+            } else {
+                bad = true;
+            }
+            k += 1;
+            qcount = 0;
+            start = pos + 1;
+        }};
+    }
+    while base < n {
+        let (sep, mut qm, nlm) = if base + 64 <= n {
+            block_masks(unsafe { &*(chunk.as_ptr().add(base) as *const [u8; 64]) })
+        } else {
+            tail = [0u8; 64];
+            tail[..n - base].copy_from_slice(&chunk[base..]);
+            block_masks(&tail)
+        };
+        let mut m = sep;
+        while m != 0 {
+            let b = m.trailing_zeros();
+            let below = if b == 0 { 0 } else { qm & (u64::MAX >> (64 - b)) };
+            qcount += below.count_ones();
+            qm &= !below;
+            let pos = base + b as usize;
+            end_field!(pos);
+            if (nlm >> b) & 1 != 0 {
+                if !bad && k == N {
+                    f(&fields);
+                }
+                k = 0;
+                bad = false;
+            }
+            m &= m - 1;
+        }
+        qcount += qm.count_ones();
+        base += 64;
+    }
+    // last line without a trailing newline
+    if start < n {
+        end_field!(n);
+        if !bad && k == N {
+            f(&fields);
+        }
     }
 }
 
@@ -443,21 +549,18 @@ fn main() {
     eprintln!("[{:?}] setup", t0.elapsed());
 
     // ---- stage 1 (concurrently): links -> name map, clicks parse; events parse + dedup
-    let (link_and_clicks, ev_kept) = rayon::join(
-        || {
-            let linkmap = build_links(&ln_files);
-            eprintln!("[{:?}] links done ({} ids)", t0.elapsed(), linkmap.id_h.len());
-            let clicks = parse_clicks(&cl_files, &ctx, &linkmap);
-            eprintln!("[{:?}] clicks parsed", t0.elapsed());
-            (linkmap, clicks)
-        },
-        || {
-            let parts = parse_events(&ev_files, &ctx);
-            eprintln!("[{:?}] events parsed", t0.elapsed());
-            parts
-        },
-    );
-    let (linkmap, click_parts) = link_and_clicks;
+    // links run on a dedicated thread (small input, sequential union-find) while all
+    // pool threads parse events.
+    let link_thread = std::thread::spawn(move || {
+        let lm = build_links(&ln_files);
+        eprintln!("[{:?}] links done ({} remapped ids)", t0.elapsed(), lm.len);
+        lm
+    });
+    let ev_kept = parse_events(&ev_files, &ctx);
+    eprintln!("[{:?}] events parsed", t0.elapsed());
+    let linkmap = link_thread.join().unwrap();
+    let click_parts = parse_clicks(&cl_files, &ctx, &linkmap);
+    eprintln!("[{:?}] clicks parsed", t0.elapsed());
 
     // ---- stage 2: dedup each eid partition, resolve person, repartition by person
     let ev_person: Vec<Vec<Vec<PEv>>> = (0..P)
@@ -527,36 +630,76 @@ fn main() {
 
 // ---------------------------------------------------------------- links
 
+/// Open-addressing table: ID hash -> person (name hash, name pointer). Only IDs whose
+/// person name differs from themselves are stored; a miss means "named by itself".
+#[derive(Clone, Copy, Default)]
+struct LinkSlot {
+    h: H2,
+    name_h: H2,
+    name_ptr: u64,
+}
+
 struct LinkMap {
-    table: HashTable<u32>,
-    id_h: Vec<H2>,
-    id_ptr: Vec<u64>,
-    root: Vec<u32>,
+    slots: Vec<LinkSlot>,
+    mask: usize,
+    len: usize,
 }
 
 impl LinkMap {
+    #[inline(always)]
+    fn prefetch(&self, h: H2) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            let p = self.slots.as_ptr().add(h.lo as usize & self.mask) as *const i8;
+            _mm_prefetch(p, _MM_HINT_T0);
+            _mm_prefetch(p.add(40), _MM_HINT_T0);
+        }
+    }
     /// Resolve an ID to its person (hash, name pointer).
     #[inline(always)]
     fn resolve(&self, h: H2, ptr: u64) -> (H2, u64) {
-        match self.table.find(h.lo, |&j| self.id_h[j as usize] == h) {
-            Some(&j) => {
-                let r = self.root[j as usize] as usize;
-                (self.id_h[r], self.id_ptr[r])
+        let mut i = h.lo as usize & self.mask;
+        loop {
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.h == h {
+                return (s.name_h, s.name_ptr);
             }
-            None => (h, ptr),
+            if s.h.lo == 0 && s.h.hi == 0 {
+                return (h, ptr);
+            }
+            i = (i + 1) & self.mask;
         }
+    }
+    fn build(entries: impl Iterator<Item = LinkSlot>, n: usize) -> LinkMap {
+        let cap = (n * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        let mut slots = vec![LinkSlot::default(); cap];
+        let mut len = 0;
+        for e in entries {
+            let mut i = e.h.lo as usize & mask;
+            while !(slots[i].h.lo == 0 && slots[i].h.hi == 0) {
+                i = (i + 1) & mask;
+            }
+            slots[i] = e;
+            len += 1;
+        }
+        LinkMap { slots, mask, len }
     }
 }
 
 fn build_links(files: &[PathBuf]) -> LinkMap {
-    let chunks = chunks_of(files, 4 << 20);
+    let datas: Vec<Bytes> = files.iter().map(|p| leak_mmap(p)).collect();
+    let chunks: Vec<Bytes> = datas
+        .into_iter()
+        .filter_map(|d| memchr::memchr(b'\n', d).map(|i| &d[i + 1..]))
+        .collect();
     let pairs: Vec<Vec<(H2, u64, H2, u64)>> = chunks
-        .par_iter()
+        .iter()
         .map(|c| {
             let mut v = Vec::new();
-            for_each_line(c, |line| {
-                let mut f: [Bytes; 2] = [&[]; 2];
-                if split_line::<2>(line, &mut f) && !f[0].is_empty() && !f[1].is_empty() {
+            for_each_record::<2>(c, |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
                     v.push((h2(f[0]), pack(f[0]), h2(f[1]), pack(f[1])));
                 }
             });
@@ -606,11 +749,22 @@ fn build_links(files: &[PathBuf]) -> LinkMap {
         }
     }
     let n = id_h.len();
+    let mut nonroot = 0usize;
     let mut root = vec![0u32; n];
     for i in 0..n as u32 {
-        root[i as usize] = find(&mut parent, i);
+        let r = find(&mut parent, i);
+        root[i as usize] = r;
+        if r != i {
+            nonroot += 1;
+        }
     }
-    LinkMap { table, id_h, id_ptr, root }
+    LinkMap::build(
+        (0..n).filter(|&i| root[i] as usize != i).map(|i| {
+            let r = root[i] as usize;
+            LinkSlot { h: id_h[i], name_h: id_h[r], name_ptr: id_ptr[r] }
+        }),
+        nonroot,
+    )
 }
 
 // ---------------------------------------------------------------- events
@@ -621,11 +775,7 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
         .par_iter()
         .map(|c| {
             let mut parts: Vec<Vec<EvRec>> = (0..P).map(|_| Vec::with_capacity(c.len() / 70 / P * 5 / 4 + 4)).collect();
-            for_each_line(c, |line| {
-                let mut f: [Bytes; 7] = [&[]; 7];
-                if !split_line::<7>(line, &mut f) {
-                    return;
-                }
+            for_each_record::<7>(c, |f| {
                 let eid = f[0];
                 if eid.is_empty() {
                     return;
@@ -696,7 +846,19 @@ fn dedup_partition(chunks: &[Vec<Vec<EvRec>>], p: usize, linkmap: &LinkMap, out:
             }
         }
     }
+    drop(table);
+    let cap = n / P * 5 / 4 + 16;
+    for o in out.iter_mut() {
+        o.reserve(cap);
+    }
+    const AHEAD: usize = 16;
     for i in 0..n {
+        if i + AHEAD < n {
+            let r2 = &recs[i + AHEAD];
+            if r2.valid {
+                linkmap.prefetch(r2.user);
+            }
+        }
         let r = &recs[i];
         if !keep[i] || !r.valid {
             continue;
@@ -709,16 +871,24 @@ fn dedup_partition(chunks: &[Vec<Vec<EvRec>>], p: usize, linkmap: &LinkMap, out:
 // ---------------------------------------------------------------- clicks
 
 fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &LinkMap) -> Vec<Vec<Vec<PCl>>> {
-    let chunks = chunks_of(files, 8 << 20);
+    let chunks = chunks_of(files, 4 << 20);
     chunks
         .par_iter()
         .map(|c| {
-            let mut parts: Vec<Vec<PCl>> = (0..P).map(|_| Vec::new()).collect();
-            for_each_line(c, |line| {
-                let mut f: [Bytes; 4] = [&[]; 4];
-                if !split_line::<4>(line, &mut f) {
-                    return;
+            let mut parts: Vec<Vec<PCl>> = (0..P).map(|_| Vec::with_capacity(c.len() / 50 / P * 5 / 4 + 4)).collect();
+            const B: usize = 32;
+            let mut batch: Vec<PCl> = Vec::with_capacity(B);
+            let flush = |batch: &mut Vec<PCl>, parts: &mut Vec<Vec<PCl>>| {
+                for x in batch.iter() {
+                    linkmap.prefetch(x.ph);
                 }
+                for x in batch.iter() {
+                    let (ph, _) = linkmap.resolve(x.ph, 0);
+                    parts[part2(ph)].push(PCl { ph, ..*x });
+                }
+                batch.clear();
+            };
+            for_each_record::<4>(c, |f| {
                 let (cid, user, camp, ts) = (f[0], f[1], f[2], f[3]);
                 if cid.is_empty() || user.is_empty() {
                     return;
@@ -731,9 +901,12 @@ fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &LinkMap) -> Vec<Vec<Vec<
                     Some(&c) => c,
                     None => return,
                 };
-                let (ph, _) = linkmap.resolve(h2(user), 0);
-                parts[part2(ph)].push(PCl { ph, cid: pack(cid), rel: (ts - ctx.base) as u32, camp });
+                batch.push(PCl { ph: h2(user), cid: pack(cid), rel: (ts - ctx.base) as u32, camp });
+                if batch.len() == B {
+                    flush(&mut batch, &mut parts);
+                }
             });
+            flush(&mut batch, &mut parts);
             parts
         })
         .collect()

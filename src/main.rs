@@ -237,7 +237,7 @@ fn d2(s: &[u8], i: usize) -> Option<u32> {
 }
 
 #[inline(always)]
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+const fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -247,7 +247,27 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
-static YEAR_START: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+const fn build_month_starts() -> [i32; 300 * 16] {
+    let mut v = [0i32; 300 * 16];
+    let mut y = 1900i64;
+    while y < 2200 {
+        let mut mo = 1u32;
+        while mo <= 13 {
+            let (yy, mm) = if mo == 13 { (y + 1, 1) } else { (y, mo) };
+            v[((y - 1900) * 16) as usize + mo as usize] = days_from_civil(yy, mm, 1) as i32;
+            mo += 1;
+        }
+        y += 1;
+    }
+    v
+}
+static MONTH_START: [i32; 300 * 16] = build_month_starts();
+
+/// days since epoch of the 1st of month `mo` (1..=13, 13 = next January) at index (y-1900)*16+mo
+#[inline(always)]
+fn month_starts() -> &'static [i32; 300 * 16] {
+    &MONTH_START
+}
 
 #[inline(always)]
 fn is_leap(y: u32) -> bool {
@@ -300,25 +320,25 @@ fn parse_datetime(s: &[u8]) -> Option<i64> {
     if mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
-    let dim = match mo {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            if is_leap(y) { 29 } else { 28 }
-        }
-    };
-    if d > dim {
-        return None;
-    }
     let days = if (1900..2200).contains(&y) {
-        const CUM: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-        YEAR_START.get_or_init(|| (1900..2200).map(|yy| days_from_civil(yy, 1, 1) as i32).collect::<Vec<i32>>())
-            [(y - 1900) as usize] as i64
-            + CUM[mo as usize] as i64
-            + (mo > 2 && is_leap(y)) as i64
-            + d as i64
-            - 1
+        let ms = month_starts();
+        let i = ((y - 1900) * 16 + mo) as usize;
+        let (m0, m1) = unsafe { (*ms.get_unchecked(i), *ms.get_unchecked(i + 1)) };
+        if d as i32 > m1 - m0 {
+            return None;
+        }
+        m0 as i64 + d as i64 - 1
     } else {
+        let dim = match mo {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if is_leap(y) { 29 } else { 28 }
+            }
+        };
+        if d > dim {
+            return None;
+        }
         days_from_civil(y as i64, mo, d)
     };
     Some(((days * 24 + h as i64) * 60 + mi as i64) * 60_000 + se as i64 * 1000)
@@ -344,27 +364,38 @@ fn parse_ingest_secs(s: &[u8]) -> Option<i64> {
     if !(1900..2200).contains(&y) || mo < 1 || mo > 12 {
         return parse_ts(s).map(|t| t.div_euclid(1000));
     }
-    const CUM: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    let days = YEAR_START.get_or_init(|| (1900..2200).map(|yy| days_from_civil(yy, 1, 1) as i32).collect::<Vec<i32>>())
-        [(y - 1900) as usize] as i64
-        + CUM[mo as usize] as i64
-        + (mo > 2 && is_leap(y)) as i64
-        + d as i64
-        - 1;
+    let days = month_starts()[((y - 1900) * 16 + mo) as usize] as i64 + d as i64 - 1;
     Some(((days * 24 + h as i64) * 60 + mi as i64) * 60 + se as i64)
+}
+
+/// Parse 8 ASCII digits (first digit in the lowest byte) to their value.
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    let x = x & 0x0F0F_0F0F_0F0F_0F0F;
+    let x = (x.wrapping_mul(10 << 8 | 1)) >> 8 & 0x00FF_00FF_00FF_00FF;
+    let x = (x.wrapping_mul(100 << 16 | 1)) >> 16 & 0x0000_FFFF_0000_FFFF;
+    (x.wrapping_mul(10000 << 32 | 1)) >> 32
 }
 
 /// Parse an event/click ts to epoch ms. None = bad timestamp.
 #[inline(always)]
 fn parse_ts(s: &[u8]) -> Option<i64> {
     let n = s.len();
-    if n == 20 && s[10] == b'T' {
-        if s[19] != b'Z' {
+    if n == 13 {
+        // F3 fast path: 13 digits
+        const Z: u64 = 0x3030_3030_3030_3030;
+        let a = ld8(s, 0) ^ Z;
+        let b = ((ld8(s, 5) ^ Z) >> 24) << 24; // digits 8..13 in the top 5 bytes, zeros below
+        if !all_digits(a, u64::MAX) || !all_digits(b, u64::MAX) {
             return None;
         }
-        return parse_datetime(s);
+        return Some((parse8(a) * 100_000 + parse8(b)) as i64);
     }
-    if n == 25 && s[10] == b'T' {
+    if (n == 20 || n == 25) && s[10] == b'T' {
+        let t = parse_datetime(s)?;
+        if n == 20 {
+            return if s[19] == b'Z' { Some(t) } else { None };
+        }
         let sign = s[19];
         if (sign != b'+' && sign != b'-') || s[22] != b':' {
             return None;
@@ -374,7 +405,6 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
         if oh > 23 || om > 59 {
             return None;
         }
-        let t = parse_datetime(s)?;
         let off = (oh as i64 * 60 + om as i64) * 60_000;
         return Some(if sign == b'+' { t - off } else { t + off });
     }
@@ -462,6 +492,23 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Split files into chunks of complete lines (headers removed).
+/// Fault a chunk's pages in with one syscall (MADV_POPULATE_READ) instead of one fault per 64 KiB.
+fn populate(c: Bytes) {
+    if c.is_empty() || std::env::var_os("SS_NOPOP").is_some() {
+        return;
+    }
+    let a = c.as_ptr() as usize & !4095;
+    let e = c.as_ptr() as usize + c.len();
+    // Only when the file is already in the page cache: on a cold cache, populating
+    // serializes the reads and loses to readahead overlapping with parsing.
+    let np = (e - a + 4095) / 4096;
+    let mut v = vec![0u8; np];
+    let r = unsafe { libc::mincore(a as *mut libc::c_void, e - a, v.as_mut_ptr()) };
+    if r != 0 || v.iter().any(|&x| x & 1 == 0) {
+        return;
+    }
+    unsafe { libc::madvise(a as *mut libc::c_void, e - a, 22) };
+}
 fn chunks_of(files: &[PathBuf], target: usize) -> Vec<Bytes> {
     let datas: Vec<Bytes> = files.par_iter().map(|p| leak_mmap(p)).collect();
     let mut out = Vec::new();
@@ -542,6 +589,13 @@ fn part2(h: H2) -> usize {
     (h.hi >> 40) as usize & (P - 1)
 }
 
+/// Capacity for one partition's share of `n` records: mean + ~3 sigma, so few vectors regrow
+/// and little untouched slack gets zeroed by the kernel.
+fn part_cap(n: usize) -> usize {
+    let m = n / P;
+    m + 3 * (m as f64).sqrt() as usize + 8
+}
+
 /// Pack a &'static [u8] into a u64 (48-bit pointer, 16-bit length).
 #[inline(always)]
 fn pack(b: Bytes) -> u64 {
@@ -555,11 +609,11 @@ fn unpack(x: u64) -> Bytes {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C, packed(4))]
 struct EvRec {
-    eid_lo: u64,
-    user: u64,
-    uptr: u64,
-    eid_hi: u32,
+    eid_lo: u64, // event_id hash (partition comes from the independent high hash word)
+    user: u64,   // user_id hash
+    uptr: u64,   // packed user_id slice
     ingest: u32, // seconds since epoch (ingest_ts is always whole-second F1)
     rel: u32,    // ts - (ws - 7d); u32::MAX = invalid event
     pc: u32,     // price << 8 | category; price 0 = not a purchase
@@ -905,7 +959,8 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
     chunks
         .par_iter()
         .map(|c| {
-            let mut parts: Vec<Vec<EvRec>> = (0..P).map(|_| Vec::with_capacity(c.len() / 70 / P * 5 / 4 + 4)).collect();
+            populate(c);
+            let mut parts: Vec<Vec<EvRec>> = (0..P).map(|_| Vec::with_capacity(part_cap(c.len() / 76))).collect();
             let nopush = std::env::var("SS_NOPUSH").is_ok();
             let mut acc_np = 0u64;
             for_each_record::<7>(c, |f| {
@@ -960,7 +1015,6 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
                     eid_lo: eh.lo,
                     user: uh,
                     uptr,
-                    eid_hi: eh.hi as u32,
                     ingest,
                     rel,
                     pc: (price << 8) | cat as u32,
@@ -972,35 +1026,73 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
         .collect()
 }
 
+thread_local! {
+    static DEDUP_TABLE: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PEv>]) {
     let n: usize = chunks.iter().map(|c| c.len()).sum();
-    // compact keys: (eid_lo, eid_hi, ingest)
-    let mut keys: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
+    assert!(n < (1 << 24));
+    // flat index -> record, for the rare tag matches
+    let mut offs: Vec<usize> = Vec::with_capacity(chunks.len() + 1);
+    offs.push(0);
     for c in &chunks {
-        keys.extend(c.iter().map(|r| (r.eid_lo, r.eid_hi, r.ingest)));
+        offs.push(offs.last().unwrap() + c.len());
     }
-    let mut table: HashTable<u32> = HashTable::with_capacity(n);
-    let mut keep = vec![true; n];
-    for i in 0..n {
-        let k = keys[i];
-        match table.entry(k.0, |&j| keys[j as usize].0 == k.0 && keys[j as usize].1 == k.1, |&j| keys[j as usize].0) {
-            hashbrown::hash_table::Entry::Occupied(mut o) => {
-                let j = *o.get() as usize;
-                if k.2 < keys[j].2 {
-                    keep[j] = false;
-                    *o.get_mut() = i as u32;
-                } else {
-                    keep[i] = false;
+    let get = |j: usize| -> &EvRec {
+        let ci = offs.partition_point(|&o| o <= j) - 1;
+        &chunks[ci][j - offs[ci]]
+    };
+    // losers bitset
+    let mut lose = vec![0u64; n / 64 + 1];
+    // open addressing: slot = eid_lo & mask, entry = (eid_lo >> 24) << 24 | (index + 1)
+    DEDUP_TABLE.with(|t| {
+        let mut t = t.borrow_mut();
+        let size = (n * 2).next_power_of_two().max(1024);
+        let mask = size - 1;
+        t.clear();
+        t.resize(size, 0);
+        let t = &mut t[..];
+        let mut i = 0usize;
+        const AHEAD: usize = 8;
+        for c in &chunks {
+            let m = c.len();
+            for x in 0..m {
+                if x + AHEAD < m {
+                    let s2 = c[x + AHEAD].eid_lo as usize & mask;
+                    unsafe { std::arch::x86_64::_mm_prefetch(t.as_ptr().add(s2) as *const i8, std::arch::x86_64::_MM_HINT_T0) };
                 }
-            }
-            hashbrown::hash_table::Entry::Vacant(v) => {
-                v.insert(i as u32);
+                let r = &c[x];
+                let h = r.eid_lo;
+                let tag = h >> 24;
+                let entry = (tag << 24) | (i as u64 + 1);
+                let mut slot = h as usize & mask;
+                loop {
+                    let e = unsafe { *t.get_unchecked(slot) };
+                    if e == 0 {
+                        unsafe { *t.get_unchecked_mut(slot) = entry };
+                        break;
+                    }
+                    if e >> 24 == tag {
+                        let j = (e & 0xFF_FFFF) as usize - 1;
+                        let rj = get(j);
+                        if { rj.eid_lo } == { r.eid_lo } {
+                            if r.ingest < rj.ingest {
+                                lose[j / 64] |= 1 << (j % 64);
+                                unsafe { *t.get_unchecked_mut(slot) = entry };
+                            } else {
+                                lose[i / 64] |= 1 << (i % 64);
+                            }
+                            break;
+                        }
+                    }
+                    slot = (slot + 1) & mask;
+                }
+                i += 1;
             }
         }
-    }
-    drop(table);
-    drop(keys);
-    let cap = n / P * 5 / 4 + 16;
+    });
+    let cap = part_cap(n);
     for o in out.iter_mut() {
         o.reserve(cap);
     }
@@ -1016,7 +1108,7 @@ fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PE
                 }
             }
             let r = &c[x];
-            let kp = keep[i];
+            let kp = lose[i / 64] >> (i % 64) & 1 == 0;
             i += 1;
             if !kp || r.rel == INVALID {
                 continue;
@@ -1034,7 +1126,8 @@ fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &LinkMap) -> Vec<Vec<Vec<
     chunks
         .par_iter()
         .map(|c| {
-            let mut parts: Vec<Vec<PCl>> = (0..P).map(|_| Vec::with_capacity(c.len() / 50 / P * 5 / 4 + 4)).collect();
+            populate(c);
+            let mut parts: Vec<Vec<PCl>> = (0..P).map(|_| Vec::with_capacity(part_cap(c.len() / 46))).collect();
             const B: usize = 32;
             let mut batch: Vec<PCl> = Vec::with_capacity(B);
             let flush = |batch: &mut Vec<PCl>, parts: &mut Vec<Vec<PCl>>| {
@@ -1496,4 +1589,65 @@ fn write_campaign(
     let mut w = ArrowWriter::try_new(std::io::BufWriter::new(f), schema, Some(props())).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
+}
+
+#[cfg(test)]
+mod ts_tests {
+    use super::*;
+    fn reference(s: &[u8]) -> Option<i64> {
+        // straightforward F1/F2/F3 parser
+        let n = s.len();
+        if n == 20 || n == 25 {
+            if s[10] != b'T' { return parse_f3(s); }
+            let num = |a: usize, b: usize| -> Option<i64> {
+                if s[a..b].iter().all(|c| c.is_ascii_digit()) { std::str::from_utf8(&s[a..b]).ok()?.parse().ok() } else { None }
+            };
+            if s[4] != b'-' || s[7] != b'-' || s[13] != b':' || s[16] != b':' { return None; }
+            let (y, mo, d, h, mi, se) = (num(0,4)?, num(5,7)?, num(8,10)?, num(11,13)?, num(14,16)?, num(17,19)?);
+            if !(1..=12).contains(&mo) || d < 1 || h > 23 || mi > 59 || se > 59 { return None; }
+            let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let dim = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo as usize - 1];
+            if d > dim { return None; }
+            let t = ((days_from_civil(y, mo as u32, d as u32) * 24 + h) * 60 + mi) * 60_000 + se * 1000;
+            if n == 20 { return if s[19] == b'Z' { Some(t) } else { None }; }
+            if (s[19] != b'+' && s[19] != b'-') || s[22] != b':' { return None; }
+            let (oh, om) = (num(20,22)?, num(23,25)?);
+            if oh > 23 || om > 59 { return None; }
+            let off = (oh * 60 + om) * 60_000;
+            return Some(if s[19] == b'+' { t - off } else { t + off });
+        }
+        parse_f3(s)
+    }
+    fn parse_f3(s: &[u8]) -> Option<i64> {
+        if s.is_empty() || !s.iter().all(|c| c.is_ascii_digit()) { return None; }
+        let v: u128 = std::str::from_utf8(s).unwrap().parse().unwrap_or(u128::MAX);
+        Some(if v > i64::MAX as u128 { i64::MAX } else { v as i64 })
+    }
+    #[test]
+    fn dates_exhaustive() {
+        for y in [1899, 1900, 1970, 1999, 2000, 2024, 2026, 2027, 2028, 2100, 2199, 2200, 9999, 0] {
+            for mo in 0..=13 { for d in 0..=32 {
+                for tail in ["Z", "+05:30", "-23:59", "+24:00", "Q"] {
+                    let s = format!("{:04}-{:02}-{:02}T12:34:56{}", y, mo, d, tail);
+                    assert_eq!(parse_ts(s.as_bytes()), reference(s.as_bytes()), "{}", s);
+                    if tail == "Z" && reference(s.as_bytes()).is_some() {
+                        assert_eq!(parse_ingest_secs(s.as_bytes()), reference(s.as_bytes()).map(|t| t / 1000), "{}", s);
+                    }
+                }
+            }}
+        }
+    }
+    #[test]
+    fn f3_random() {
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let alpha = b"0123456789012345678901234567890123456789-:Tx ";
+        for i in 0..2_000_000u64 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let n = [13, 13, 13, 12, 14, 1, 19, 20, 21][(i % 9) as usize];
+            let mut s = Vec::new();
+            let mut y = x;
+            for _ in 0..n { y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); s.push(alpha[((y >> 33) % if i % 3 == 0 { alpha.len() as u64 } else { 10 }) as usize]); }
+            assert_eq!(parse_ts(&s), reference(&s), "{:?}", std::str::from_utf8(&s));
+        }
+    }
 }

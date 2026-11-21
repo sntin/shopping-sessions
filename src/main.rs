@@ -228,6 +228,8 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
+static YEAR_START: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+
 #[inline(always)]
 fn is_leap(y: u32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
@@ -258,7 +260,18 @@ fn parse_datetime(s: &[u8]) -> Option<i64> {
     if d > dim {
         return None;
     }
-    let days = days_from_civil(y as i64, mo, d);
+    let days = if (1900..2200).contains(&y) {
+        // table lookup: days before Jan 1 of y, plus cumulative month days
+        const CUM: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        YEAR_START.get_or_init(|| (1900..2200).map(|yy| days_from_civil(yy, 1, 1) as i32).collect::<Vec<i32>>())
+            [(y - 1900) as usize] as i64
+            + CUM[mo as usize] as i64
+            + (mo > 2 && is_leap(y)) as i64
+            + d as i64
+            - 1
+    } else {
+        days_from_civil(y as i64, mo, d)
+    };
     Some(((days * 24 + h as i64) * 60 + mi as i64) * 60_000 + se as i64 * 1000)
 }
 

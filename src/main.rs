@@ -14,9 +14,6 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 
-mod halloc;
-#[global_allocator]
-static GLOBAL: halloc::HugeAlloc = halloc::HugeAlloc;
 
 type Bytes = &'static [u8];
 
@@ -456,23 +453,22 @@ fn unpack(x: u64) -> Bytes {
 
 #[derive(Clone, Copy)]
 struct EvRec {
-    eid: H2,
+    eid_lo: u64,
     user: H2,
     uptr: u64,
-    ingest: i64,
-    rel: u32,
-    price: u32, // 0 = not a purchase
-    cat: u16,
-    valid: bool,
+    eid_hi: u32,
+    ingest: u32, // seconds since epoch (ingest_ts is always whole-second F1)
+    rel: u32,    // ts - (ws - 7d); u32::MAX = invalid event
+    pc: u32,     // price << 8 | category; price 0 = not a purchase
 }
+const INVALID: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct PEv {
     ph: H2,
     pptr: u64,
     rel: u32, // ts - (ws - 7d)
-    price: u32,
-    cat: u16,
+    pc: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -519,6 +515,7 @@ fn main() {
         products.entry(pid).or_insert(c);
     }
     let unknown_cat = cat_names.len() as u16;
+    assert!(unknown_cat < 256, "more than 255 categories");
     cat_names.push(b"unknown");
     // rank of each category by byte order (for tie-breaks)
     let mut order: Vec<u16> = (0..cat_names.len() as u16).collect();
@@ -563,15 +560,21 @@ fn main() {
     eprintln!("[{:?}] clicks parsed", t0.elapsed());
 
     // ---- stage 2: dedup each eid partition, resolve person, repartition by person
-    let ev_person: Vec<Vec<Vec<PEv>>> = (0..P)
+    // transpose chunk-major -> partition-major so each partition's input is freed after use
+    let mut by_part: Vec<Vec<Vec<EvRec>>> = (0..P).map(|_| Vec::with_capacity(ev_kept.len())).collect();
+    for chunk in ev_kept {
+        for (p, v) in chunk.into_iter().enumerate() {
+            by_part[p].push(v);
+        }
+    }
+    let ev_person: Vec<Vec<Vec<PEv>>> = by_part
         .into_par_iter()
-        .map(|p| {
+        .map(|chunks| {
             let mut out: Vec<Vec<PEv>> = (0..P).map(|_| Vec::new()).collect();
-            dedup_partition(&ev_kept, p, &linkmap, &mut out);
+            dedup_partition(chunks, &linkmap, &mut out);
             out
         })
         .collect();
-    drop(ev_kept);
     eprintln!("[{:?}] dedup done", t0.elapsed());
 
     // ---- stage 3: per person partition: sessionize, attribute, aggregate
@@ -624,6 +627,11 @@ fn main() {
 
     write_campaign(&camp_dir.join("part-00000.parquet"), &camp_acc, ncamp, ndays, ws_day, &camp_ids, &camp_chan);
     eprintln!("[{:?}] done", t0.elapsed());
+    if let Ok(st) = fs::read_to_string("/proc/self/status") {
+        for l in st.lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("RssAnon") || l.starts_with("RssFile")) {
+            eprintln!("{}", l);
+        }
+    }
     // Skip destructors of huge structures.
     std::process::exit(0);
 }
@@ -813,25 +821,38 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
                     valid = false;
                 }
                 let eh = h2(eid);
-                let (uh, uptr, rel) = if valid { (h2(user), pack(user), (ts - ctx.base) as u32) } else { (H2::default(), 0, 0) };
-                parts[part2(eh)].push(EvRec { eid: eh, user: uh, uptr, ingest, rel, price, cat, valid });
+                let (uh, uptr, rel) = if valid { (h2(user), pack(user), (ts - ctx.base) as u32) } else { (H2::default(), 0, INVALID) };
+                let ingest = if ingest == i64::MAX { u32::MAX } else { (ingest / 1000).clamp(0, u32::MAX as i64 - 1) as u32 };
+                parts[part2(eh)].push(EvRec {
+                    eid_lo: eh.lo,
+                    user: uh,
+                    uptr,
+                    eid_hi: eh.hi as u32,
+                    ingest,
+                    rel,
+                    pc: (price << 8) | cat as u32,
+                });
             });
             parts
         })
         .collect()
 }
 
-fn dedup_partition(chunks: &[Vec<Vec<EvRec>>], p: usize, linkmap: &LinkMap, out: &mut [Vec<PEv>]) {
-    let n: usize = chunks.iter().map(|c| c[p].len()).sum();
+fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PEv>]) {
+    let n: usize = chunks.iter().map(|c| c.len()).sum();
     let mut recs: Vec<EvRec> = Vec::with_capacity(n);
     for c in chunks {
-        recs.extend_from_slice(&c[p]);
+        recs.extend_from_slice(&c);
     }
     let mut table: HashTable<u32> = HashTable::with_capacity(n);
     let mut keep = vec![true; n];
     for i in 0..n {
         let r = &recs[i];
-        match table.entry(r.eid.lo, |&j| recs[j as usize].eid == r.eid, |&j| recs[j as usize].eid.lo) {
+        match table.entry(
+            r.eid_lo,
+            |&j| recs[j as usize].eid_lo == r.eid_lo && recs[j as usize].eid_hi == r.eid_hi,
+            |&j| recs[j as usize].eid_lo,
+        ) {
             hashbrown::hash_table::Entry::Occupied(mut o) => {
                 let j = *o.get() as usize;
                 if r.ingest < recs[j].ingest {
@@ -855,16 +876,16 @@ fn dedup_partition(chunks: &[Vec<Vec<EvRec>>], p: usize, linkmap: &LinkMap, out:
     for i in 0..n {
         if i + AHEAD < n {
             let r2 = &recs[i + AHEAD];
-            if r2.valid {
+            if r2.rel != INVALID {
                 linkmap.prefetch(r2.user);
             }
         }
         let r = &recs[i];
-        if !keep[i] || !r.valid {
+        if !keep[i] || r.rel == INVALID {
             continue;
         }
         let (ph, pptr) = linkmap.resolve(r.user, r.uptr);
-        out[part2(ph)].push(PEv { ph, pptr, rel: r.rel, price: r.price, cat: r.cat });
+        out[part2(ph)].push(PEv { ph, pptr, rel: r.rel, pc: r.pc });
     }
 }
 
@@ -945,7 +966,7 @@ fn process_person_partition(
     let mut names: Vec<Bytes> = Vec::new();
     let ne: usize = ev_person.iter().map(|v| v[p].len()).sum();
     // (key = pid<<32 | rel, price, cat)
-    let mut evs: Vec<(u64, u32, u16)> = Vec::with_capacity(ne);
+    let mut evs: Vec<(u64, u32)> = Vec::with_capacity(ne);
     for v in ev_person {
         for e in &v[p] {
             let pid = match table.entry(e.ph.lo, |&j| names_h[j as usize] == e.ph, |&j| names_h[j as usize].lo) {
@@ -958,7 +979,7 @@ fn process_person_partition(
                     id
                 }
             };
-            evs.push(((pid as u64) << 32 | e.rel as u64, e.price, e.cat));
+            evs.push(((pid as u64) << 32 | e.rel as u64, e.pc));
         }
     }
     let nc: usize = click_parts.iter().map(|v| v[p].len()).sum();
@@ -977,6 +998,8 @@ fn process_person_partition(
     let ncat = cat_rank.len();
     let mut catsum = vec![0i64; ncat];
     let mut ci = 0usize; // click cursor (global over sorted cls)
+    let mut starts: Vec<i64> = Vec::new();
+    let mut sdays: Vec<usize> = Vec::new();
     let mut i = 0usize;
     while i < evs.len() {
         let pid = evs[i].0 >> 32;
@@ -994,6 +1017,10 @@ fn process_person_partition(
         }
         let pcl = &cls[c0..ci];
         let name = names[pid as usize];
+        // Persons with many clicks (shared devices) use an interval sweep for assists.
+        let heavy = pcl.len() > heavy_threshold();
+        starts.clear();
+        sdays.clear();
 
         // user-day accumulator
         let mut cur_day: i64 = i64::MIN;
@@ -1027,11 +1054,12 @@ fn process_person_partition(
                 }
                 prev = t;
                 s_ev += 1;
-                let pr = evs[m].1;
+                let pc = evs[m].1;
+                let pr = pc >> 8;
                 if pr > 0 {
                     s_rev += pr as i64;
                     s_purch = true;
-                    catsum[evs[m].2 as usize] += pr as i64;
+                    catsum[(pc & 0xFF) as usize] += pr as i64;
                 }
                 m += 1;
             }
@@ -1065,7 +1093,10 @@ fn process_person_partition(
                 cacc[base_i + 1] += 1;
             }
             cacc[base_i + 2] += s_rev as u64;
-            if hi > lo {
+            if heavy {
+                starts.push(start);
+                sdays.push(didx);
+            } else if hi > lo {
                 *stamp_ctr = stamp_ctr.wrapping_add(1);
                 if *stamp_ctr == u32::MAX {
                     stamp.iter_mut().for_each(|x| *x = u32::MAX - 1);
@@ -1085,7 +1116,68 @@ fn process_person_partition(
         if cur_day != i64::MIN {
             flush_day(rows, name, cur_day, d_sess, d_ev, d_rev, any_purchase, &mut catsum, cat_rank);
         }
+        if heavy {
+            heavy_assists(pcl, &starts, &sdays, ndays, cacc);
+        }
         i = j;
+    }
+}
+
+fn heavy_threshold() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("SS_HEAVY").ok().and_then(|s| s.parse().ok()).unwrap_or(64))
+}
+
+/// Assists for one person via merged click intervals: a campaign assists a session starting
+/// at s iff one of its clicks c has c <= s <= c + 7d. Sessions are sorted by start.
+fn heavy_assists(pcl: &[(u64, Bytes, u16)], starts: &[i64], sdays: &[usize], ndays: usize, cacc: &mut [u64]) {
+    if starts.is_empty() {
+        return;
+    }
+    let mut day_first = vec![0usize; ndays + 1];
+    {
+        let mut k = 0usize;
+        for d in 0..=ndays {
+            while k < sdays.len() && sdays[k] < d {
+                k += 1;
+            }
+            day_first[d] = k;
+        }
+    }
+    let mut cc: Vec<(u16, i64)> = pcl.iter().map(|c| (c.2, (c.0 & 0xFFFF_FFFF) as i64)).collect();
+    cc.sort_unstable();
+    let mut x = 0usize;
+    while x < cc.len() {
+        let camp = cc[x].0 as usize;
+        let mut a = cc[x].1;
+        let mut b = a + WEEK;
+        x += 1;
+        loop {
+            let more = x < cc.len() && cc[x].0 as usize == camp;
+            if more && cc[x].1 <= b {
+                b = b.max(cc[x].1 + WEEK);
+                x += 1;
+                continue;
+            }
+            // flush [a, b]
+            let i0 = starts.partition_point(|&s| s < a);
+            let i1 = starts.partition_point(|&s| s <= b);
+            if i0 < i1 {
+                for d in sdays[i0]..=sdays[i1 - 1] {
+                    let lo = i0.max(day_first[d]);
+                    let hi = i1.min(day_first[d + 1]);
+                    if hi > lo {
+                        cacc[(camp * ndays + d) * 4 + 3] += (hi - lo) as u64;
+                    }
+                }
+            }
+            if !more {
+                break;
+            }
+            a = cc[x].1;
+            b = a + WEEK;
+            x += 1;
+        }
     }
 }
 

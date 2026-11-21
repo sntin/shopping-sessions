@@ -350,7 +350,7 @@ fn leak_mmap(path: &Path) -> Bytes {
     if len == 0 {
         return &[];
     }
-    let m = unsafe { memmap2::MmapOptions::new().populate().map(&f) }.expect("mmap");
+    let m = unsafe { memmap2::MmapOptions::new().map(&f) }.expect("mmap");
     let m = Box::leak(Box::new(m));
     &m[..]
 }

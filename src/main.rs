@@ -840,22 +840,19 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Vec<Vec<EvRec>>> {
 
 fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PEv>]) {
     let n: usize = chunks.iter().map(|c| c.len()).sum();
-    let mut recs: Vec<EvRec> = Vec::with_capacity(n);
-    for c in chunks {
-        recs.extend_from_slice(&c);
+    // compact keys: (eid_lo, eid_hi, ingest)
+    let mut keys: Vec<(u64, u32, u32)> = Vec::with_capacity(n);
+    for c in &chunks {
+        keys.extend(c.iter().map(|r| (r.eid_lo, r.eid_hi, r.ingest)));
     }
     let mut table: HashTable<u32> = HashTable::with_capacity(n);
     let mut keep = vec![true; n];
     for i in 0..n {
-        let r = &recs[i];
-        match table.entry(
-            r.eid_lo,
-            |&j| recs[j as usize].eid_lo == r.eid_lo && recs[j as usize].eid_hi == r.eid_hi,
-            |&j| recs[j as usize].eid_lo,
-        ) {
+        let k = keys[i];
+        match table.entry(k.0, |&j| keys[j as usize].0 == k.0 && keys[j as usize].1 == k.1, |&j| keys[j as usize].0) {
             hashbrown::hash_table::Entry::Occupied(mut o) => {
                 let j = *o.get() as usize;
-                if r.ingest < recs[j].ingest {
+                if k.2 < keys[j].2 {
                     keep[j] = false;
                     *o.get_mut() = i as u32;
                 } else {
@@ -868,24 +865,31 @@ fn dedup_partition(chunks: Vec<Vec<EvRec>>, linkmap: &LinkMap, out: &mut [Vec<PE
         }
     }
     drop(table);
+    drop(keys);
     let cap = n / P * 5 / 4 + 16;
     for o in out.iter_mut() {
         o.reserve(cap);
     }
     const AHEAD: usize = 16;
-    for i in 0..n {
-        if i + AHEAD < n {
-            let r2 = &recs[i + AHEAD];
-            if r2.rel != INVALID {
-                linkmap.prefetch(r2.user);
+    let mut i = 0usize;
+    for c in &chunks {
+        let m = c.len();
+        for x in 0..m {
+            if x + AHEAD < m {
+                let r2 = &c[x + AHEAD];
+                if r2.rel != INVALID {
+                    linkmap.prefetch(r2.user);
+                }
             }
+            let r = &c[x];
+            let kp = keep[i];
+            i += 1;
+            if !kp || r.rel == INVALID {
+                continue;
+            }
+            let (ph, pptr) = linkmap.resolve(r.user, r.uptr);
+            out[part2(ph)].push(PEv { ph, pptr, rel: r.rel, pc: r.pc });
         }
-        let r = &recs[i];
-        if !keep[i] || r.rel == INVALID {
-            continue;
-        }
-        let (ph, pptr) = linkmap.resolve(r.user, r.uptr);
-        out[part2(ph)].push(PEv { ph, pptr, rel: r.rel, pc: r.pc });
     }
 }
 
@@ -992,8 +996,22 @@ fn process_person_partition(
             }
         }
     }
-    evs.sort_unstable_by_key(|e| e.0);
-    cls.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    // counting sort by person, then sort each person's (small) slice
+    let np = names.len();
+    let (mut evs, eoff) = group_by_pid(evs, np, |e| (e.0 >> 32) as usize);
+    for w in eoff.windows(2) {
+        let sl = &mut evs[w[0] as usize..w[1] as usize];
+        if sl.len() > 1 {
+            sl.sort_unstable_by_key(|e| e.0);
+        }
+    }
+    let (mut cls, coff) = group_by_pid(cls, np, |c| (c.0 >> 32) as usize);
+    for w in coff.windows(2) {
+        let sl = &mut cls[w[0] as usize..w[1] as usize];
+        if sl.len() > 1 {
+            sl.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        }
+    }
 
     let ncat = cat_rank.len();
     let mut catsum = vec![0i64; ncat];
@@ -1121,6 +1139,27 @@ fn process_person_partition(
         }
         i = j;
     }
+}
+
+/// Stable counting sort of `v` by person id; returns the grouped vector and offsets (len np+1).
+fn group_by_pid<T: Copy>(v: Vec<T>, np: usize, pid_of: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
+    let mut off = vec![0u32; np + 1];
+    for x in &v {
+        off[pid_of(x) + 1] += 1;
+    }
+    for i in 0..np {
+        off[i + 1] += off[i];
+    }
+    let mut pos = off.clone();
+    let mut out: Vec<T> = Vec::with_capacity(v.len());
+    let dst = out.spare_capacity_mut();
+    for x in &v {
+        let p = pid_of(x);
+        dst[pos[p] as usize].write(*x);
+        pos[p] += 1;
+    }
+    unsafe { out.set_len(v.len()) };
+    (out, off)
 }
 
 fn heavy_threshold() -> usize {

@@ -618,6 +618,13 @@ struct PEv {
     pc: u32,
 }
 
+/// A click in the person stage: ts << 32 | campaign, and the packed click_id.
+#[derive(Clone, Copy)]
+struct Ck {
+    k: u64,
+    cid: u64,
+}
+
 #[derive(Clone, Copy)]
 struct PCl {
     ph: u64,
@@ -630,9 +637,96 @@ struct Ctx {
     ws: i64,
     we: i64,
     base: i64, // ws - 7d
-    products: HashMap<Bytes, u16>,
+    products: IdMap,
     unknown_cat: u16,
-    campaigns: HashMap<Bytes, u16>,
+    campaigns: IdMap,
+}
+
+/// Exact string -> u16 map for the small reference tables. Keys of 1 to 7 bytes are
+/// packed into a u64 (bytes + length in the top byte) and found in an open-addressing
+/// table with no string compare; longer keys use a regular hash map.
+struct IdMap {
+    keys: Vec<u64>, // 0 = empty
+    vals: Vec<u16>,
+    shift: u32,
+    long: HashMap<Bytes, u16>,
+}
+
+impl IdMap {
+    fn new(n: usize) -> Self {
+        let size = (n * 4).next_power_of_two().max(64);
+        IdMap { keys: vec![0; size], vals: vec![0; size], shift: 64 - size.trailing_zeros(), long: HashMap::new() }
+    }
+    /// Packed key of a short string (len <= 7), None for longer ones.
+    #[inline(always)]
+    fn key(b: &[u8]) -> Option<u64> {
+        let n = b.len();
+        if n > 7 || n == 0 {
+            return None;
+        }
+        let p = b.as_ptr();
+        // 8-byte load when it stays inside the page (mapped memory), else copy
+        let x = if (p as usize & 4095) <= 4088 {
+            unsafe { std::ptr::read_unaligned(p as *const u64) }
+        } else {
+            let mut t = [0u8; 8];
+            t[..n].copy_from_slice(b);
+            u64::from_le_bytes(t)
+        };
+        let x = x & (u64::MAX >> (64 - 8 * n as u32));
+        Some(x | (n as u64) << 56)
+    }
+    #[inline(always)]
+    fn slot(&self, k: u64) -> usize {
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+    /// Insert if absent; returns false if the key was already present.
+    fn insert(&mut self, b: Bytes, v: u16) -> bool {
+        match Self::key(b) {
+            None => {
+                if self.long.contains_key(b) {
+                    return false;
+                }
+                self.long.insert(b, v);
+                true
+            }
+            Some(k) => {
+                let mask = self.keys.len() - 1;
+                let mut i = self.slot(k);
+                loop {
+                    if self.keys[i] == k {
+                        return false;
+                    }
+                    if self.keys[i] == 0 {
+                        self.keys[i] = k;
+                        self.vals[i] = v;
+                        return true;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+    }
+    #[inline(always)]
+    fn get(&self, b: &[u8]) -> Option<u16> {
+        match Self::key(b) {
+            None => self.long.get(b).copied(),
+            Some(k) => {
+                let mask = self.keys.len() - 1;
+                let mut i = self.slot(k);
+                loop {
+                    let e = unsafe { *self.keys.get_unchecked(i) };
+                    if e == k {
+                        return Some(unsafe { *self.vals.get_unchecked(i) });
+                    }
+                    if e == 0 {
+                        return None;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+    }
 }
 
 fn main() {
@@ -658,13 +752,14 @@ fn main() {
     // products / categories
     let mut cat_names: Vec<Bytes> = Vec::new();
     let mut cat_idx: HashMap<Bytes, u16> = HashMap::new();
-    let mut products: HashMap<Bytes, u16> = HashMap::new();
-    for (pid, cat) in read_small_table(&data_dir.join("products.csv")) {
+    let ptab = read_small_table(&data_dir.join("products.csv"));
+    let mut products = IdMap::new(ptab.len());
+    for (pid, cat) in ptab {
         let c = *cat_idx.entry(cat).or_insert_with(|| {
             cat_names.push(cat);
             (cat_names.len() - 1) as u16
         });
-        products.entry(pid).or_insert(c);
+        products.insert(pid, c);
     }
     let unknown_cat = cat_names.len() as u16;
     assert!(unknown_cat < 256, "more than 255 categories");
@@ -680,10 +775,10 @@ fn main() {
     // campaigns
     let mut camp_ids: Vec<Bytes> = Vec::new();
     let mut camp_chan: Vec<Bytes> = Vec::new();
-    let mut campaigns: HashMap<Bytes, u16> = HashMap::new();
-    for (cid, ch) in read_small_table(&data_dir.join("campaigns.csv")) {
-        if !campaigns.contains_key(cid) {
-            campaigns.insert(cid, camp_ids.len() as u16);
+    let ctab = read_small_table(&data_dir.join("campaigns.csv"));
+    let mut campaigns = IdMap::new(ctab.len());
+    for (cid, ch) in ctab {
+        if campaigns.insert(cid, camp_ids.len() as u16) {
             camp_ids.push(cid);
             camp_chan.push(ch);
         }
@@ -1272,7 +1367,7 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<EvChunk> {
                     (_, true) => match parse_price(f[6]) {
                         Some(p) => {
                             price = p;
-                            cat = *ctx.products.get(f[5]).unwrap_or(&ctx.unknown_cat);
+                            cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
                         }
                         None => valid = false,
                     },
@@ -1414,7 +1509,7 @@ fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &LinkMap) -> Vec<Vec<Vec<
                     _ => return,
                 };
                 let camp = match ctx.campaigns.get(camp) {
-                    Some(&c) => c,
+                    Some(c) => c,
                     None => return,
                 };
                 batch.push(PCl { ph: h1(user), cid: pack(cid), rel: (ts - ctx.base) as u32, camp });
@@ -1531,23 +1626,40 @@ fn process_person_partition(
         }
     }
     let nc: usize = click_parts.iter().map(|v| v[p].len()).sum();
-    let mut cls: Vec<(u64, Bytes, u16)> = Vec::with_capacity(nc);
+    // clicks of persons with events, grouped by person: key = ts << 32 | campaign
+    let mut cpid: Vec<u32> = Vec::with_capacity(nc);
+    let mut cls0: Vec<Ck> = Vec::with_capacity(nc);
     for v in click_parts {
         for c in &v[p] {
-            // only persons that have events matter
             if let Some(&pid) = table.find(c.ph, |&j| names_h[j as usize] == c.ph) {
-                cls.push(((pid as u64) << 32 | c.rel as u64, unpack(c.cid), c.camp));
+                cpid.push(pid);
+                cls0.push(Ck { k: (c.rel as u64) << 32 | c.camp as u64, cid: c.cid });
             }
         }
     }
-    let (mut cls, coff) = group_by_pid(cls, np, |c| (c.0 >> 32) as usize);
-    for c in cls.iter_mut() {
-        c.0 &= 0xFFFF_FFFF;
+    let mut coff = vec![0u32; np + 1];
+    for &x in &cpid {
+        coff[x as usize + 1] += 1;
     }
+    for i in 0..np {
+        coff[i + 1] += coff[i];
+    }
+    let mut cls: Vec<Ck> = Vec::with_capacity(cls0.len());
+    {
+        let mut pos = coff.clone();
+        let dst = cls.spare_capacity_mut();
+        for (x, c) in cpid.iter().zip(cls0.iter()) {
+            dst[pos[*x as usize] as usize].write(*c);
+            pos[*x as usize] += 1;
+        }
+        unsafe { cls.set_len(cls0.len()) };
+    }
+    drop(cls0);
+    drop(cpid);
     for w in coff.windows(2) {
         let sl = &mut cls[w[0] as usize..w[1] as usize];
         if sl.len() > 1 {
-            sl.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+            sl.sort_unstable_by_key(|c| c.k);
         }
     }
 
@@ -1613,20 +1725,25 @@ fn process_person_partition(
             any_purchase |= s_purch;
 
             // attribution
-            while hi < pcl.len() && ((pcl[hi].0 & 0xFFFF_FFFF) as i64) <= start {
+            while hi < pcl.len() && ((pcl[hi].k >> 32) as i64) <= start {
                 hi += 1;
             }
-            while lo < hi && ((pcl[lo].0 & 0xFFFF_FFFF) as i64) < start - WEEK {
+            while lo < hi && ((pcl[lo].k >> 32) as i64) < start - WEEK {
                 lo += 1;
             }
             let didx = (day - ws_day) as usize;
             let credited = if hi > lo {
+                // latest click; on a tie in ts, the smallest click_id
                 let mut q = hi - 1;
-                let t = pcl[q].0;
-                while q > lo && pcl[q - 1].0 == t {
+                let t = pcl[q].k >> 32;
+                let mut best = q;
+                while q > lo && pcl[q - 1].k >> 32 == t {
                     q -= 1;
+                    if unpack(pcl[q].cid) < unpack(pcl[best].cid) {
+                        best = q;
+                    }
                 }
-                pcl[q].2 as usize
+                (pcl[best].k & 0xFFFF) as usize
             } else {
                 organic
             };
@@ -1647,7 +1764,7 @@ fn process_person_partition(
                 }
                 let sc = *stamp_ctr;
                 for c in &pcl[lo..hi] {
-                    let cc = c.2 as usize;
+                    let cc = (c.k & 0xFFFF) as usize;
                     if stamp[cc] != sc {
                         stamp[cc] = sc;
                         cacc[(cc * ndays + didx) * 4 + 3] += 1;
@@ -1665,27 +1782,6 @@ fn process_person_partition(
     }
 }
 
-/// Stable counting sort of `v` by person id; returns the grouped vector and offsets (len np+1).
-fn group_by_pid<T: Copy>(v: Vec<T>, np: usize, pid_of: impl Fn(&T) -> usize) -> (Vec<T>, Vec<u32>) {
-    let mut off = vec![0u32; np + 1];
-    for x in &v {
-        off[pid_of(x) + 1] += 1;
-    }
-    for i in 0..np {
-        off[i + 1] += off[i];
-    }
-    let mut pos = off.clone();
-    let mut out: Vec<T> = Vec::with_capacity(v.len());
-    let dst = out.spare_capacity_mut();
-    for x in &v {
-        let p = pid_of(x);
-        dst[pos[p] as usize].write(*x);
-        pos[p] += 1;
-    }
-    unsafe { out.set_len(v.len()) };
-    (out, off)
-}
-
 fn heavy_threshold() -> usize {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("SS_HEAVY").ok().and_then(|s| s.parse().ok()).unwrap_or(64))
@@ -1693,7 +1789,7 @@ fn heavy_threshold() -> usize {
 
 /// Assists for one person via merged click intervals: a campaign assists a session starting
 /// at s iff one of its clicks c has c <= s <= c + 7d. Sessions are sorted by start.
-fn heavy_assists(pcl: &[(u64, Bytes, u16)], starts: &[i64], sdays: &[usize], ndays: usize, cacc: &mut [u64]) {
+fn heavy_assists(pcl: &[Ck], starts: &[i64], sdays: &[usize], ndays: usize, cacc: &mut [u64]) {
     if starts.is_empty() {
         return;
     }
@@ -1707,7 +1803,7 @@ fn heavy_assists(pcl: &[(u64, Bytes, u16)], starts: &[i64], sdays: &[usize], nda
             day_first[d] = k;
         }
     }
-    let mut cc: Vec<(u16, i64)> = pcl.iter().map(|c| (c.2, (c.0 & 0xFFFF_FFFF) as i64)).collect();
+    let mut cc: Vec<(u16, i64)> = pcl.iter().map(|c| ((c.k & 0xFFFF) as u16, (c.k >> 32) as i64)).collect();
     cc.sort_unstable();
     let mut x = 0usize;
     while x < cc.len() {

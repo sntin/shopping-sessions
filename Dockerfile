@@ -10,6 +10,6 @@ RUN cargo build --release --locked && strip target/release/ss
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/ss /app/ss
-ENV MIMALLOC_PURGE_DELAY=-1 SS_THREADS=6 SS_LINKTHREADS=2
+ENV MIMALLOC_PURGE_DELAY=-1 SS_THREADS=16
 USER 1000:1000
 CMD ["/app/ss"]

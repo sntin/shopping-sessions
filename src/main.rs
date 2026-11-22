@@ -584,90 +584,6 @@ fn part1(h: u64) -> usize {
     (h >> 40) as usize & (P - 1)
 }
 
-/// Person key: the name itself when it is 1-10 characters of `-0-9A-Za-z_` (6 bits each,
-/// length in the low nibble; exact and invertible), otherwise a 60-bit hash of the name with
-/// low nibble 0xF. Person records then need no name pointer: short names are decoded from
-/// the key and long ones come from a side list.
-const LONGK: u64 = 0xF;
-
-const fn build_code() -> [u8; 256] {
-    let mut t = [0xFFu8; 256];
-    t[b'-' as usize] = 0;
-    let mut i = 0;
-    while i < 10 {
-        t[b'0' as usize + i] = 1 + i as u8;
-        i += 1;
-    }
-    i = 0;
-    while i < 26 {
-        t[b'A' as usize + i] = 11 + i as u8;
-        t[b'a' as usize + i] = 38 + i as u8;
-        i += 1;
-    }
-    t[b'_' as usize] = 37;
-    t
-}
-static CODE: [u8; 256] = build_code();
-
-const fn build_decode() -> [u8; 64] {
-    let c = build_code();
-    let mut d = [0u8; 64];
-    let mut i = 0;
-    while i < 256 {
-        if c[i] != 0xFF {
-            d[c[i] as usize] = i as u8;
-        }
-        i += 1;
-    }
-    d
-}
-static DECODE: [u8; 64] = build_decode();
-
-#[inline(always)]
-fn pkey(b: &[u8]) -> u64 {
-    let n = b.len();
-    if (1..=10).contains(&n) {
-        let mut k = 0u64;
-        let mut bad = 0u8;
-        for (i, &c) in b.iter().enumerate() {
-            let x = CODE[c as usize];
-            bad |= x;
-            k |= ((x & 63) as u64) << (58 - 6 * i);
-        }
-        if bad & 0xC0 == 0 {
-            return k | n as u64;
-        }
-    }
-    (h1(b) & !0xF) | LONGK
-}
-
-/// Decode a short person key into `out`.
-fn decode_key(k: u64, out: &mut Vec<u8>) {
-    let n = (k & 0xF) as usize;
-    for i in 0..n {
-        out.push(DECODE[((k >> (58 - 6 * i)) & 63) as usize]);
-    }
-}
-
-#[inline(always)]
-fn mixk(k: u64) -> u64 {
-    let x = (k ^ (k >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    let x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
-/// Person partition of a person key.
-#[inline(always)]
-fn partk(k: u64) -> usize {
-    (mixk(k) >> 56) as usize & (P - 1)
-}
-
-/// Hash of a person key for tables inside one partition (independent of the partition bits).
-#[inline(always)]
-fn hashk(k: u64) -> u64 {
-    mixk(k ^ 0x9E37_79B9_7F4A_7C15)
-}
-
 #[inline(always)]
 fn part2(h: H2) -> usize {
     (h.hi >> 40) as usize & (P - 1)
@@ -696,7 +612,8 @@ const INVALID: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct PEv {
-    pk: u64,  // person key
+    ph: u64,
+    pptr: u64,
     rel: u32, // ts - (ws - 7d)
     pc: u32,
 }
@@ -907,14 +824,7 @@ fn main() {
         }
     }
     drop(lost_lists);
-    let mut ev_long: Vec<Vec<Vec<(u64, u64)>>> = Vec::with_capacity(ev_chunks.len());
-    let ev_person: Vec<Vec<Vec<PEv>>> = ev_chunks
-        .into_iter()
-        .map(|c| {
-            ev_long.push(c.long);
-            c.pev
-        })
-        .collect();
+    let ev_person: Vec<Vec<Vec<PEv>>> = ev_chunks.into_iter().map(|c| c.pev).collect();
     let _ = nchunks;
     eprintln!("[{:?}] dedup done", t0.elapsed());
 
@@ -953,7 +863,6 @@ fn main() {
                     process_person_partition(
                         p,
                         &ev_person,
-                        &ev_long,
                         &lost_by_p[p],
                         &click_parts,
                         ws_day,
@@ -1022,22 +931,21 @@ impl LinkMap {
             _mm_prefetch(p.add(40), _MM_HINT_T0);
         }
     }
-    /// Resolve an ID hash to its person (key, name pointer); None = named by itself.
+    /// Resolve an ID to its person (hash, name pointer).
     #[inline(always)]
-    fn resolve(&self, h: u64) -> Option<(u64, u64)> {
+    fn resolve(&self, h: u64, ptr: u64) -> (u64, u64) {
         let mut i = h as usize & self.mask;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
             if s.h == h {
-                return Some((s.name_h, s.name_ptr));
+                return (s.name_h, s.name_ptr);
             }
             if s.h == 0 {
-                return None;
+                return (h, ptr);
             }
             i = (i + 1) & self.mask;
         }
     }
-
     fn build(entries: impl Iterator<Item = LinkSlot>, n: usize) -> LinkMap {
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
@@ -1240,7 +1148,7 @@ fn build_links_par(files: &[PathBuf]) -> LinkMap {
             let hk = unsafe { &*(std::ptr::addr_of_mut!((*sp).h) as *const AtomicU64) };
             if hk.compare_exchange(0, h, AcqRel, Acquire).is_ok() {
                 unsafe {
-                    (*sp).name_h = pkey(unpack(id_ptr[r]));
+                    (*sp).name_h = id_h[r];
                     (*sp).name_ptr = id_ptr[r];
                 }
                 return;
@@ -1353,7 +1261,7 @@ fn build_links(files: &[PathBuf]) -> LinkMap {
     LinkMap::build(
         (0..n).filter(|&i| root[i] as usize != i).map(|i| {
             let r = root[i] as usize;
-            LinkSlot { h: id_h[i], name_h: pkey(unpack(id_ptr[r])), name_ptr: id_ptr[r] }
+            LinkSlot { h: id_h[i], name_h: id_h[r], name_ptr: id_ptr[r] }
         }),
         nonroot,
     )
@@ -1384,9 +1292,8 @@ struct DRec {
 const NOLOC: u32 = u32::MAX;
 
 struct EvChunk {
-    pev: Vec<Vec<PEv>>,          // by person partition
-    long: Vec<Vec<(u64, u64)>>,  // (person key, name pointer) of long-named persons, by person partition
-    drec: Vec<Vec<DRec>>,        // by event partition
+    pev: Vec<Vec<PEv>>,  // by person partition
+    drec: Vec<Vec<DRec>>, // by event partition
 }
 
 static LINKS: std::sync::OnceLock<LinkMap> = std::sync::OnceLock::new();
@@ -1397,7 +1304,6 @@ fn place_chunk(ci: usize, buf: &[LRec], linkmap: &LinkMap) -> EvChunk {
     let n = buf.len();
     let mut pev: Vec<Vec<PEv>> = (0..P).map(|_| Vec::with_capacity(part_cap(n))).collect();
     let mut drec: Vec<Vec<DRec>> = (0..P).map(|_| Vec::with_capacity(part_cap(n))).collect();
-    let mut long: Vec<Vec<(u64, u64)>> = (0..P).map(|_| Vec::new()).collect();
     const AHEAD: usize = 16;
     for x in 0..n {
         if x + AHEAD < n {
@@ -1409,23 +1315,16 @@ fn place_chunk(ci: usize, buf: &[LRec], linkmap: &LinkMap) -> EvChunk {
         let r = &buf[x];
         let mut loc = NOLOC;
         if r.rel != INVALID {
-            let (pk, pptr) = match linkmap.resolve(r.user) {
-                Some(x) => x,
-                None if r.eid_part >> 31 != 0 => ((r.user & !0xF) | LONGK, r.uptr),
-                None => (r.uptr, 0),
-            };
-            let p = partk(pk);
-            if pk & 0xF == LONGK {
-                long[p].push((pk, pptr));
-            }
+            let (ph, pptr) = linkmap.resolve(r.user, r.uptr);
+            let p = part1(ph);
             let v = &mut pev[p];
             assert!(v.len() < (1 << 14));
             loc = (ci as u32) << 22 | (p as u32) << 14 | v.len() as u32;
-            v.push(PEv { pk, rel: r.rel, pc: r.pc });
+            v.push(PEv { ph, pptr, rel: r.rel, pc: r.pc });
         }
-        drec[(r.eid_part & 0xFF) as usize].push(DRec { eid_lo: r.eid_lo, ingest: r.ingest, loc });
+        drec[r.eid_part as usize].push(DRec { eid_lo: r.eid_lo, ingest: r.ingest, loc });
     }
-    EvChunk { pev, long, drec }
+    EvChunk { pev, drec }
 }
 
 fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<EvChunk> {
@@ -1496,20 +1395,9 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<EvChunk> {
                     valid = false;
                 }
                 let eh = h2(eid);
-                // uptr holds the user's own person key when it is short, else a pointer to it
-                // (flagged in bit 31 of eid_part): the key is computed while the line is hot
-                let (uh, uptr, rel, lf) = if valid {
-                    let k = pkey(user);
-                    if k & 0xF == LONGK {
-                        (h1(user), pack(user), (ts - ctx.base) as u32, 1u32 << 31)
-                    } else {
-                        (h1(user), k, (ts - ctx.base) as u32, 0)
-                    }
-                } else {
-                    (0, 0, INVALID, 0)
-                };
+                let (uh, uptr, rel) = if valid { (h1(user), pack(user), (ts - ctx.base) as u32) } else { (0, 0, INVALID) };
                 let ingest = match ingest_s { Some(t) => t.clamp(0, u32::MAX as i64 - 1) as u32, None => u32::MAX };
-                buf.push(LRec { eid_lo: eh.lo, user: uh, uptr, eid_part: part2(eh) as u32 | lf, ingest, rel, pc: (price << 8) | cat as u32 });
+                buf.push(LRec { eid_lo: eh.lo, user: uh, uptr, eid_part: part2(eh) as u32, ingest, rel, pc: (price << 8) | cat as u32 });
                 });
                 match LINKS.get() {
                     Some(lm) => Out::Done(place_chunk(ci, &buf, lm)),
@@ -1618,17 +1506,14 @@ fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &LinkMap) -> Vec<Vec<Vec<
             populate(c);
             let mut parts: Vec<Vec<PCl>> = (0..P).map(|_| Vec::with_capacity(part_cap(c.len() / 46))).collect();
             const B: usize = 32;
-            let mut batch: Vec<(PCl, u64)> = Vec::with_capacity(B);
-            let flush = |batch: &mut Vec<(PCl, u64)>, parts: &mut Vec<Vec<PCl>>| {
+            let mut batch: Vec<PCl> = Vec::with_capacity(B);
+            let flush = |batch: &mut Vec<PCl>, parts: &mut Vec<Vec<PCl>>| {
                 for x in batch.iter() {
-                    linkmap.prefetch(x.0.ph);
+                    linkmap.prefetch(x.ph);
                 }
-                for (x, own) in batch.iter() {
-                    let pk = match linkmap.resolve(x.ph) {
-                        Some((k, _)) => k,
-                        None => *own,
-                    };
-                    parts[partk(pk)].push(PCl { ph: pk, ..*x });
+                for x in batch.iter() {
+                    let (ph, _) = linkmap.resolve(x.ph, 0);
+                    parts[part1(ph)].push(PCl { ph, ..*x });
                 }
                 batch.clear();
             };
@@ -1645,7 +1530,7 @@ fn parse_clicks(files: &[PathBuf], ctx: &Ctx, linkmap: &LinkMap) -> Vec<Vec<Vec<
                     Some(c) => c,
                     None => return,
                 };
-                batch.push((PCl { ph: h1(user), cid: pack(cid), rel: (ts - ctx.base) as u32, camp }, pkey(user)));
+                batch.push(PCl { ph: h1(user), cid: pack(cid), rel: (ts - ctx.base) as u32, camp });
                 if batch.len() == B {
                     flush(&mut batch, &mut parts);
                 }
@@ -1672,7 +1557,6 @@ struct UserRows {
 fn process_person_partition(
     p: usize,
     ev_person: &[Vec<Vec<PEv>>],
-    ev_long: &[Vec<Vec<(u64, u64)>>],
     lost: &[u32],
     click_parts: &[Vec<Vec<PCl>>],
     ws_day: i64,
@@ -1688,6 +1572,7 @@ fn process_person_partition(
     // intern persons by 128-bit hash
     let mut table: HashTable<u32> = HashTable::new();
     let mut names_h: Vec<u64> = Vec::new();
+    let mut names: Vec<Bytes> = Vec::new();
     // flat index of each chunk's slice, and the losers of dedup as a bitset over it
     let mut offs: Vec<u32> = Vec::with_capacity(ev_person.len() + 1);
     offs.push(0);
@@ -1712,11 +1597,12 @@ fn process_person_partition(
                 epid.push(u32::MAX);
                 continue;
             }
-            let pid = match table.entry(hashk(e.pk), |&j| names_h[j as usize] == e.pk, |&j| hashk(names_h[j as usize])) {
+            let pid = match table.entry(e.ph, |&j| names_h[j as usize] == e.ph, |&j| names_h[j as usize]) {
                 hashbrown::hash_table::Entry::Occupied(o) => *o.get(),
                 hashbrown::hash_table::Entry::Vacant(v) => {
                     let id = names_h.len() as u32;
-                    names_h.push(e.pk);
+                    names_h.push(e.ph);
+                    names.push(unpack(e.pptr));
                     ecnt.push(0);
                     v.insert(id);
                     id
@@ -1726,33 +1612,7 @@ fn process_person_partition(
             epid.push(pid);
         }
     }
-    let np = names_h.len();
-    // names: short keys decode in place; long ones come from the chunks' side lists
-    let names: Vec<Bytes> = {
-        let mut longs: HashMap<u64, u64> = HashMap::new();
-        for v in ev_long {
-            for &(k, ptr) in &v[p] {
-                longs.insert(k, ptr);
-            }
-        }
-        let mut arena: Vec<u8> = Vec::with_capacity(np * 10);
-        let mut spans: Vec<(u32, u32)> = Vec::with_capacity(np);
-        for &k in &names_h {
-            if k & 0xF == LONGK {
-                spans.push((u32::MAX, 0));
-            } else {
-                let a = arena.len();
-                decode_key(k, &mut arena);
-                spans.push((a as u32, (arena.len() - a) as u32));
-            }
-        }
-        let arena: &'static [u8] = Box::leak(arena.into_boxed_slice());
-        names_h
-            .iter()
-            .zip(spans.iter())
-            .map(|(&k, &(a, l))| if a == u32::MAX { unpack(longs[&k]) } else { &arena[a as usize..(a + l) as usize] })
-            .collect()
-    };
+    let np = names.len();
     // counting sort: evs grouped by person as (rel << 32 | pc)
     let mut eoff = vec![0u32; np + 1];
     for i in 0..np {
@@ -1789,7 +1649,7 @@ fn process_person_partition(
     let mut cls0: Vec<Ck> = Vec::with_capacity(nc);
     for v in click_parts {
         for c in &v[p] {
-            if let Some(&pid) = table.find(hashk(c.ph), |&j| names_h[j as usize] == c.ph) {
+            if let Some(&pid) = table.find(c.ph, |&j| names_h[j as usize] == c.ph) {
                 cpid.push(pid);
                 cls0.push(Ck { k: (c.rel as u64) << 32 | c.camp as u64, cid: c.cid });
             }

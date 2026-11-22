@@ -744,23 +744,6 @@ fn main() {
     let env_n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
     rayon::ThreadPoolBuilder::new().num_threads(env_n("SS_THREADS").unwrap_or(ncpu).max(1)).build_global().unwrap();
 
-    let ln_files = list_csv(&data_dir.join("links"));
-    // Links start first: they need nothing from the small tables loaded below.
-    // ---- stage 1 (concurrently): links -> name map, clicks parse; events parse + dedup
-    // links run on a dedicated thread (small input, sequential union-find) while all
-    // pool threads parse events.
-    let ln_files2 = ln_files.clone();
-    let build = move || {
-        let lm = if std::env::var_os("SS_OLDLINKS").is_some() { build_links(&ln_files2) } else { build_links_par(&ln_files2) };
-        eprintln!("[{:?}] links done ({} remapped ids)", t0.elapsed(), lm.len);
-        let _ = LINKS.set(lm);
-    };
-    // Links build on their own small pool while all main pool threads parse events;
-    // chunks parsed before the link map is ready wait in a side buffer.
-    let nl = env_n("SS_LINKTHREADS").unwrap_or(ncpu / 2).max(1);
-    let lt = std::thread::spawn(move || {
-        rayon::ThreadPoolBuilder::new().num_threads(nl).build().unwrap().install(build);
-    });
     let manifest = fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
     let we = parse_ts(json_str(&manifest, "window_end").as_bytes()).expect("window_end");
@@ -806,15 +789,29 @@ fn main() {
 
     let ev_files = list_csv(&data_dir.join("events"));
     let cl_files = list_csv(&data_dir.join("clicks"));
+    let ln_files = list_csv(&data_dir.join("links"));
     eprintln!("[{:?}] setup", t0.elapsed());
 
-    let ev_outs = parse_events(&ev_files, &ctx);
+    // ---- stage 1 (concurrently): links -> name map, clicks parse; events parse + dedup
+    // links run on a dedicated thread (small input, sequential union-find) while all
+    // pool threads parse events.
+    let ln_files2 = ln_files.clone();
+    let build = move || {
+        let lm = if std::env::var_os("SS_OLDLINKS").is_some() { build_links(&ln_files2) } else { build_links_par(&ln_files2) };
+        eprintln!("[{:?}] links done ({} remapped ids)", t0.elapsed(), lm.len);
+        let _ = LINKS.set(lm);
+    };
+    // Links build on their own small pool while all main pool threads parse events;
+    // chunks parsed before the link map is ready wait in a side buffer.
+    let nl = env_n("SS_LINKTHREADS").unwrap_or(ncpu / 2).max(1);
+    let lt = std::thread::spawn(move || {
+        rayon::ThreadPoolBuilder::new().num_threads(nl).build().unwrap().install(build);
+    });
+    let ev_chunks = parse_events(&ev_files, &ctx);
     lt.join().unwrap();
     eprintln!("[{:?}] events parsed", t0.elapsed());
     let linkmap = LINKS.get().unwrap();
-    // deferred event chunks and all clicks share the pool (no wait between them)
-    let (ev_chunks, click_parts) =
-        rayon::join(|| finish_events(ev_outs, linkmap), || parse_clicks(&cl_files, &ctx, &linkmap));
+    let click_parts = parse_clicks(&cl_files, &ctx, &linkmap);
     eprintln!("[{:?}] clicks parsed", t0.elapsed());
 
     // ---- stage 2: dedup each event partition; losers are marked per person partition
@@ -1330,13 +1327,7 @@ fn place_chunk(ci: usize, buf: &[LRec], linkmap: &LinkMap) -> EvChunk {
     EvChunk { pev, drec }
 }
 
-/// A parsed event chunk: placed already, or waiting for the link map.
-enum Out {
-    Done(EvChunk),
-    Later(Vec<LRec>),
-}
-
-fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Out> {
+fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<EvChunk> {
     let total: usize = files.iter().map(|f| fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0)).sum();
     let cmb: usize = std::env::var("SS_CHUNKMB").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     // Each file adds at most one partial chunk, so keep chunks < 1024 (10 bits in a record location).
@@ -1346,7 +1337,11 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Out> {
     thread_local! {
         static BUF: std::cell::RefCell<Vec<LRec>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    chunks
+    enum Out {
+        Done(EvChunk),
+        Later(Vec<LRec>),
+    }
+    let outs: Vec<Out> = chunks
         .par_iter()
         .enumerate()
         .map(|(ci, c)| {
@@ -1410,12 +1405,14 @@ fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<Out> {
                 }
             })
         })
-        .collect()
-}
-
-/// Place the chunks that were parsed before the link map was ready.
-fn finish_events(outs: Vec<Out>, lm: &LinkMap) -> Vec<EvChunk> {
+        .collect();
     let nlater = outs.iter().filter(|o| matches!(o, Out::Later(_))).count();
+    let lm = {
+        while LINKS.get().is_none() {
+            std::thread::yield_now();
+        }
+        LINKS.get().unwrap()
+    };
     let res: Vec<EvChunk> = outs
         .into_par_iter()
         .enumerate()

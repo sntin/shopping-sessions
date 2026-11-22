@@ -838,15 +838,17 @@ fn main() {
 
     let cat_names_s: Vec<String> = cat_names.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
 
-    const GROUP: usize = 8; // partitions per output file
-    let camp_acc: Vec<u64> = (0..P / GROUP)
+    // partitions per task / output file (power of two dividing P)
+    let group: usize = env_n("SS_GROUP").filter(|g| g.is_power_of_two() && *g <= P).unwrap_or(8);
+    let csize = (ncamp + 1) * ndays * 4;
+    // campaign accumulators: one per rayon fold split (about one per thread), not per task
+    let camp_acc: Vec<u64> = (0..P / group)
         .into_par_iter()
-        .map(|g| {
-            let mut cacc = vec![0u64; (ncamp + 1) * ndays * 4];
+        .fold(|| vec![0u64; csize], |mut cacc, g| {
             let mut rows = UserRows::default();
             let mut stamp = vec![u32::MAX; ncamp + 1];
             let mut stamp_ctr = 0u32;
-            for p in g * GROUP..(g + 1) * GROUP {
+            for p in g * group..(g + 1) * group {
                 process_person_partition(
                     p,
                     &ev_person,
@@ -874,7 +876,7 @@ fn main() {
             }
             a
         })
-        .unwrap();
+        .unwrap_or_else(|| vec![0u64; csize]);
     eprintln!("[{:?}] sessions + user_daily written", t0.elapsed());
 
     write_campaign(&camp_dir.join("part-00000.parquet"), &camp_acc, ncamp, ndays, ws_day, &camp_ids, &camp_chan);

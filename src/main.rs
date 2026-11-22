@@ -838,45 +838,58 @@ fn main() {
 
     let cat_names_s: Vec<String> = cat_names.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect();
 
-    // partitions per task / output file (power of two dividing P)
-    let group: usize = env_n("SS_GROUP").filter(|g| g.is_power_of_two() && *g <= P).unwrap_or(8);
+    // partitions per task (power of two dividing P)
+    let group: usize = env_n("SS_GROUP").filter(|g| g.is_power_of_two() && *g <= P).unwrap_or(4);
     let csize = (ncamp + 1) * ndays * 4;
-    // campaign accumulators: one per rayon fold split (about one per thread), not per task
-    let camp_acc: Vec<u64> = (0..P / group)
+    // One worker per pool thread takes tasks from a shared counter and keeps its own
+    // campaign totals and user rows; each worker writes one user_daily file, so the
+    // file count is the thread count, not the task count.
+    let ntasks = P / group;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let nworkers = rayon::current_num_threads().clamp(1, ntasks);
+    let accs: Vec<Vec<u64>> = (0..nworkers)
         .into_par_iter()
-        .fold(|| vec![0u64; csize], |mut cacc, g| {
+        .map(|w| {
+            let mut cacc = vec![0u64; csize];
             let mut rows = UserRows::default();
             let mut stamp = vec![u32::MAX; ncamp + 1];
             let mut stamp_ctr = 0u32;
-            for p in g * group..(g + 1) * group {
-                process_person_partition(
-                    p,
-                    &ev_person,
-                    &lost_by_p[p],
-                    &click_parts,
-                    ws_day,
-                    base,
-                    ndays,
-                    organic,
-                    &cat_rank,
-                    &mut cacc,
-                    &mut rows,
-                    &mut stamp,
-                    &mut stamp_ctr,
-                );
+            loop {
+                let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if g >= ntasks {
+                    break;
+                }
+                for p in g * group..(g + 1) * group {
+                    process_person_partition(
+                        p,
+                        &ev_person,
+                        &lost_by_p[p],
+                        &click_parts,
+                        ws_day,
+                        base,
+                        ndays,
+                        organic,
+                        &cat_rank,
+                        &mut cacc,
+                        &mut rows,
+                        &mut stamp,
+                        &mut stamp_ctr,
+                    );
+                }
             }
-            if !rows.day.is_empty() || g == 0 {
-                write_user_rows(&user_dir.join(format!("part-{:05}.parquet", g)), &rows, &cat_names_s);
+            if !rows.day.is_empty() || w == 0 {
+                write_user_rows(&user_dir.join(format!("part-{:05}.parquet", w)), &rows, &cat_names_s);
             }
             cacc
         })
-        .reduce_with(|mut a, b| {
-            for (x, y) in a.iter_mut().zip(b.iter()) {
-                *x += *y;
-            }
-            a
-        })
-        .unwrap_or_else(|| vec![0u64; csize]);
+        .collect();
+    let mut camp_acc = vec![0u64; csize];
+    for a in &accs {
+        for (x, y) in camp_acc.iter_mut().zip(a.iter()) {
+            *x += *y;
+        }
+    }
+    drop(accs);
     eprintln!("[{:?}] sessions + user_daily written", t0.elapsed());
 
     write_campaign(&camp_dir.join("part-00000.parquet"), &camp_acc, ncamp, ndays, ws_day, &camp_ids, &camp_chan);

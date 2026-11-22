@@ -647,7 +647,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu.max(1)).build_global().unwrap();
+    let env_n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    rayon::ThreadPoolBuilder::new().num_threads(env_n("SS_THREADS").unwrap_or(ncpu).max(1)).build_global().unwrap();
 
     let manifest = fs::read_to_string(data_dir.join("manifest.json")).expect("manifest");
     let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
@@ -707,7 +708,7 @@ fn main() {
     };
     // Links build on their own small pool while all main pool threads parse events;
     // chunks parsed before the link map is ready wait in a side buffer.
-    let nl = (std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize) / 2).max(1);
+    let nl = env_n("SS_LINKTHREADS").unwrap_or(ncpu / 2).max(1);
     let lt = std::thread::spawn(move || {
         rayon::ThreadPoolBuilder::new().num_threads(nl).build().unwrap().install(build);
     });

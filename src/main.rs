@@ -1315,7 +1315,9 @@ fn place_chunk(ci: usize, buf: &[LRec], linkmap: &LinkMap) -> EvChunk {
 fn parse_events(files: &[PathBuf], ctx: &Ctx) -> Vec<EvChunk> {
     let total: usize = files.iter().map(|f| fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0)).sum();
     let cmb: usize = std::env::var("SS_CHUNKMB").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    let chunks = chunks_of(files, (cmb << 20).max(total / 1000 + 1));
+    // Each file adds at most one partial chunk, so keep chunks < 1024 (10 bits in a record location).
+    let budget = 1023usize.saturating_sub(files.len()).max(64);
+    let chunks = chunks_of(files, (cmb << 20).max(total / budget + 1));
     assert!(chunks.len() < 1024);
     thread_local! {
         static BUF: std::cell::RefCell<Vec<LRec>> = const { std::cell::RefCell::new(Vec::new()) };
